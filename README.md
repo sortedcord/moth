@@ -6,6 +6,15 @@ Linux + Wayland only. UI in [gpui](https://gpui.rs) (Vulkan via wgpu); video via
 `waylandsink` attaching a `wl_subsurface` to the gpui window so hardware-decoded frames (VA-API
 dmabufs) go straight to the compositor.
 
+## Performance
+
+![moth vs YouTube in Helium: 6.5× less CPU, 8.1× less memory, 15× fewer processes](docs/benchmark.svg)
+
+Same video, codec and resolution in both, hardware-decoded via VA-API, averaged over 40 s of playback.
+CPU, memory and GPU are measured over each app's whole process tree; power is the CPU package's
+draw above idle (RAPL), which is noisy to about ±0.2 W. moth still uses mock data, so it doesn't yet
+pay for loading a real watch page the way the browser does.
+
 ## Setup (Arch)
 
 ```sh

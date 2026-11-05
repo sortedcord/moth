@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="600" viewBox="0 0 900 600" role="img" aria-labelledby="title desc">
+  <title id="title">moth vs YouTube in Helium: resource usage</title>
+  <desc id="desc">Playing the same 1080p AV1 video with hardware decoding. moth uses 7.1% CPU versus 46.2%, 143 MB of memory versus 1,159 MB, 1 process versus 15, 0.85 W above idle versus 1.02 W, and 0.1% GPU render time versus 3.2%.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#1d2540"/>
+      <stop offset="1" stop-color="#131929"/>
+    </linearGradient>
+    <linearGradient id="moth" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ff6b78"/>
+      <stop offset="1" stop-color="#e94b5a"/>
+    </linearGradient>
+    <linearGradient id="helium" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#5d6887"/>
+      <stop offset="1" stop-color="#7d87a3"/>
+    </linearGradient>
+    <style>
+      text { font-family: Outfit, Inter, "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; }
+      .text { fill: #e8ebf4; }
+      .muted { fill: #9aa3bb; }
+      .faint { fill: #6b7490; }
+      .label { font-size: 15px; font-weight: 600; }
+      .sub { font-size: 12px; }
+      .val { font-size: 12.5px; font-weight: 600; }
+      .badge { font-size: 13px; font-weight: 700; fill: #ff7a86; }
+      .track { fill: #ffffff; fill-opacity: 0.04; }
+    </style>
+  </defs>
+
+  <rect x="0.5" y="0.5" width="899" height="599" rx="22" fill="url(#bg)" stroke="#2c3552"/>
+
+  <!-- Header -->
+  <rect x="40" y="38" width="34" height="24" rx="7" fill="#e94b5a"/>
+  <path d="M52 44.5 L63.5 50 L52 55.5 Z" fill="#fff"/>
+  <text x="86" y="58" class="text" font-size="24" font-weight="700">moth <tspan class="muted" font-weight="500">vs YouTube in Helium</tspan></text>
+  <text x="40" y="90" class="faint" font-size="13">“Spring” (Blender Studio) · 2048×858 AV1 + Opus · VA-API hardware decode · 40 s average</text>
+
+  <!-- Legend -->
+  <rect x="688" y="42" width="12" height="12" rx="3" fill="url(#moth)"/>
+  <text x="708" y="53" class="text" font-size="13" font-weight="600">moth</text>
+  <rect x="760" y="42" width="12" height="12" rx="3" fill="url(#helium)"/>
+  <text x="780" y="53" class="muted" font-size="13" font-weight="600">Helium 0.20</text>
+
+  <!-- Bars: x0 = 250, full scale = 420 px per metric -->
+
+  <!-- CPU -->
+  <g transform="translate(0,130)">
+    <text x="40" y="20" class="text label">CPU</text>
+    <text x="40" y="40" class="faint sub">avg, % of one core</text>
+    <rect x="250" y="4" width="420" height="18" rx="5" class="track"/>
+    <rect x="250" y="4" width="64.5" height="18" rx="5" fill="url(#moth)"/>
+    <text x="324.5" y="17.5" class="text val">7.1%</text>
+    <rect x="250" y="28" width="420" height="18" rx="5" class="track"/>
+    <rect x="250" y="28" width="420" height="18" rx="5" fill="url(#helium)"/>
+    <text x="680" y="41.5" class="muted val">46.2%</text>
+    <rect x="762" y="11" width="98" height="28" rx="14" fill="#e94b5a" fill-opacity="0.14"/>
+    <text x="811" y="30" class="badge" text-anchor="middle">6.5× less</text>
+  </g>
+
+  <!-- Memory -->
+  <g transform="translate(0,208)">
+    <text x="40" y="20" class="text label">Memory</text>
+    <text x="40" y="40" class="faint sub">PSS, whole process tree</text>
+    <rect x="250" y="4" width="420" height="18" rx="5" class="track"/>
+    <rect x="250" y="4" width="51.8" height="18" rx="5" fill="url(#moth)"/>
+    <text x="311.8" y="17.5" class="text val">143 MB</text>
+    <rect x="250" y="28" width="420" height="18" rx="5" class="track"/>
+    <rect x="250" y="28" width="420" height="18" rx="5" fill="url(#helium)"/>
+    <text x="680" y="41.5" class="muted val">1,159 MB</text>
+    <rect x="762" y="11" width="98" height="28" rx="14" fill="#e94b5a" fill-opacity="0.14"/>
+    <text x="811" y="30" class="badge" text-anchor="middle">8.1× less</text>
+  </g>
+
+  <!-- Processes -->
+  <g transform="translate(0,286)">
+    <text x="40" y="20" class="text label">Processes</text>
+    <text x="40" y="40" class="faint sub">while playing</text>
+    <rect x="250" y="4" width="420" height="18" rx="5" class="track"/>
+    <rect x="250" y="4" width="28" height="18" rx="5" fill="url(#moth)"/>
+    <text x="288" y="17.5" class="text val">1</text>
+    <rect x="250" y="28" width="420" height="18" rx="5" class="track"/>
+    <rect x="250" y="28" width="420" height="18" rx="5" fill="url(#helium)"/>
+    <text x="680" y="41.5" class="muted val">15</text>
+    <rect x="762" y="11" width="98" height="28" rx="14" fill="#e94b5a" fill-opacity="0.14"/>
+    <text x="811" y="30" class="badge" text-anchor="middle">15× fewer</text>
+  </g>
+
+  <!-- GPU render -->
+  <g transform="translate(0,364)">
+    <text x="40" y="20" class="text label">GPU render</text>
+    <text x="40" y="40" class="faint sub">3D engine busy time</text>
+    <rect x="250" y="4" width="420" height="18" rx="5" class="track"/>
+    <rect x="250" y="4" width="13" height="18" rx="5" fill="url(#moth)"/>
+    <text x="273" y="17.5" class="text val">0.1%</text>
+    <rect x="250" y="28" width="420" height="18" rx="5" class="track"/>
+    <rect x="250" y="28" width="420" height="18" rx="5" fill="url(#helium)"/>
+    <text x="680" y="41.5" class="muted val">3.2%</text>
+    <rect x="762" y="11" width="98" height="28" rx="14" fill="#e94b5a" fill-opacity="0.14"/>
+    <text x="811" y="30" class="badge" text-anchor="middle">≈30× less</text>
+  </g>
+
+  <!-- Power -->
+  <g transform="translate(0,442)">
+    <text x="40" y="20" class="text label">Power</text>
+    <text x="40" y="40" class="faint sub">CPU package, above idle</text>
+    <rect x="250" y="4" width="420" height="18" rx="5" class="track"/>
+    <rect x="250" y="4" width="350" height="18" rx="5" fill="url(#moth)"/>
+    <text x="610" y="17.5" class="text val">+0.85 W</text>
+    <rect x="250" y="28" width="420" height="18" rx="5" class="track"/>
+    <rect x="250" y="28" width="420" height="18" rx="5" fill="url(#helium)"/>
+    <text x="680" y="41.5" class="muted val">+1.02 W</text>
+    <rect x="762" y="11" width="98" height="28" rx="14" fill="#e94b5a" fill-opacity="0.14"/>
+    <text x="811" y="30" class="badge" text-anchor="middle">17% less</text>
+  </g>
+
+  <!-- Footer -->
+  <line x1="40" y1="530" x2="860" y2="530" stroke="#2c3552"/>
+  <text x="40" y="553" class="faint" font-size="11.5">Intel Core Ultra 5 225H (Arc iGPU, i915) · niri · Helium 0.20.3 (Chromium 156) with uBlock Origin, signed in, single tab</text>
+  <text x="40" y="572" class="faint" font-size="11.5">Video decode engine load was equal (3.7%). moth's video is composited by niri, which is counted in power but not in moth's CPU/GPU rows.</text>
+</svg>

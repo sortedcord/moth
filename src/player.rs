@@ -28,11 +28,13 @@ pub struct StreamUrls {
 
 /// Resolve direct stream URLs with yt-dlp. Blocking; call from a background thread.
 pub fn resolve_streams(video_id: &str) -> Result<StreamUrls> {
+    // Dev aid: `MOTH_FORMAT=<yt-dlp format>` overrides the format selection (e.g. to force AV1).
+    let format = std::env::var("MOTH_FORMAT").unwrap_or_else(|_| FORMAT.to_string());
     let out = Command::new("yt-dlp")
         .args([
             "--no-warnings",
             "-f",
-            FORMAT,
+            &format,
             "--print",
             "%(vcodec)s|%(width)sx%(height)s@%(fps)s|%(acodec)s",
             "--print",
