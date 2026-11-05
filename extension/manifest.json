@@ -1,0 +1,54 @@
+{
+  "manifest_version": 3,
+  "name": "Open in moth",
+  "version": "0.1.0",
+  "description": "Opens YouTube videos in moth, the native YouTube client for Linux, instead of the browser.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA48lcyLDqp70EdQ8Zgt1sVv9mAEbeuw9HpjHpXnfkyS26hYVNxXvLd7Fyvn+kKWntq5QGSQarBvDUmt+IC0Uo5HxbUdOJnU+3EbqNsMRjqLmj/+twlxc09zsFV8e7uMRvsiNjEcGFZAZ3yP1pQdDxEjW7yuBNZEZaDc9B7hh7jTh10ZkHboXS12yVxCOk9JM6px5QJkWw6g/pOXRvkwXqpFoTXLRAL+H4qLtNjUV/+39VEJW2kN5lOS69MGtQIBgEn0gmESr0WbYxTEJrr2bdSp3kR3LK/I5i3sRUpoT9S4FWfsFlez4dZPtBjYTu4eSCRCf1JAGrk2pu/E3Ma/bl7QIDAQAB",
+  "permissions": [
+    "nativeMessaging",
+    "declarativeNetRequest",
+    "webNavigation",
+    "storage"
+  ],
+  "host_permissions": [
+    "*://www.youtube.com/*",
+    "*://youtube.com/*",
+    "*://m.youtube.com/*",
+    "*://youtu.be/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "watch",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "handoff.html"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ],
+  "action": {
+    "default_title": "YouTube videos open in moth (click to turn off)",
+    "default_icon": {
+      "16": "icons/16.png",
+      "32": "icons/32.png"
+    }
+  },
+  "icons": {
+    "16": "icons/16.png",
+    "32": "icons/32.png",
+    "48": "icons/48.png",
+    "128": "icons/128.png"
+  }
+}

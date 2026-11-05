@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Opening in moth</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: center;
+      background: linear-gradient(160deg, #1d2540, #131929); color: #e8ebf4;
+      font: 15px/1.5 system-ui, sans-serif;
+    }
+    main { max-width: 34rem; padding: 2rem; text-align: center; }
+    h1 { font-size: 1.25rem; font-weight: 600; margin: 0 0 .5rem; }
+    p { color: #9aa3bb; margin: 0 0 1.25rem; word-break: break-all; }
+    .error { color: #ff8a95; }
+    button {
+      font: inherit; font-weight: 600; color: #fff; background: #e94b5a; border: 0;
+      border-radius: 999px; padding: .55rem 1.2rem; cursor: pointer;
+    }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1 id="title">Opening in moth…</h1>
+    <p id="detail"></p>
+    <button id="browser" hidden>Watch in the browser instead</button>
+  </main>
+  <script src="handoff.js"></script>
+</body>
+</html>
