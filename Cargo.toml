@@ -1,0 +1,31 @@
+[package]
+name = "moth"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# gpui is vendored from Zed main (wgpu renderer); see scripts/fetch-vendor.sh for the pinned rev.
+gpui = { path = "vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
+gpui_linux = { path = "vendor/zed/crates/gpui_linux", default-features = false, features = ["wayland"] }
+gstreamer = "0.24"
+gstreamer-video = "0.24"
+raw-window-handle = "0.6"
+anyhow = "1"
+
+# Zed patches these crates to its own forks; gpui relies on them.
+[patch.crates-io]
+async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
+async-task = { git = "https://github.com/zed-industries/async-task.git", rev = "015845a19fc31752c02367567d3b8900a406f9da" }
+calloop = { git = "https://github.com/zed-industries/calloop", rev = "3759371fee14c40066d64777e2a36b6ffcc22590" }
+
+[profile.dev]
+# Keep our crate fast to compile but dependencies (gpui, wgpu, lyon...) optimized.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 16
