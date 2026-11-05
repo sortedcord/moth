@@ -15,16 +15,16 @@ use std::time::Duration;
 use gpui::{
     AnyElement, App, Bounds, Context, Entity, FocusHandle, Focusable as _, FontWeight, Hsla, Image, ImageFormat,
     ImageSource, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit, PathBuilder, Pixels, SharedString,
-    Subscription, Task, Window, WindowBounds, WindowDecorations, WindowOptions, canvas, div, img,
+    Subscription, Task, Window, WindowBounds, WindowDecorations, WindowOptions, anchored, canvas, deferred, div, img,
     linear_color_stop, linear_gradient, point, prelude::*, px, rgb, rgba, size,
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 
 use data::VIDEOS;
-use player::{Player, PlayerEvent, Rect, StreamUrls};
+use player::{Player, PlayerEvent, Rect, Start, StreamUrls};
 use settings::{RESOLUTIONS, Settings};
 use text_input::{Submit, TextInput};
-use youtube::{RelatedVideo, WatchPage, YouTube};
+use youtube::{RelatedVideo, StreamCatalog, WatchPage, YouTube};
 
 // ── Palette (from the mock, minus the glass) ────────────────────────────────
 const BG_TOP: u32 = 0x1d2540;
@@ -149,6 +149,43 @@ enum Page {
     Failed(SharedString),
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum MenuPage {
+    Main,
+    Quality,
+    Format,
+    Track,
+    Audio,
+    Speed,
+}
+
+#[derive(Clone)]
+enum MenuAction {
+    Open(MenuPage),
+    /// `None` = automatic.
+    Quality(Option<(u32, u8)>),
+    Video(u32),
+    Audio(u32),
+    Track(String),
+    Speed(f64),
+}
+
+struct MenuItem {
+    label: String,
+    detail: Option<String>,
+    selected: bool,
+    action: MenuAction,
+}
+
+const SPEEDS: [f64; 8] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+const MENU_W: f32 = 300.0;
+const MENU_ROW_H: f32 = 38.0;
+const MENU_HEADER_H: f32 = 44.0;
+
+fn speed_label(rate: f64) -> String {
+    if (rate - 1.0).abs() < 1e-9 { "Normal".to_string() } else { format!("{rate}×") }
+}
+
 #[derive(Clone, PartialEq)]
 enum Status {
     Idle,
@@ -165,6 +202,8 @@ enum Status {
 #[derive(Default)]
 struct PlayerSlot {
     pending: Option<StreamUrls>,
+    /// Where the next player should begin (stream switches resume mid-video).
+    start: Option<Start>,
     /// Whether web-client URLs for the same files are being resolved for `pending`.
     fallback_pending: bool,
     /// Resolved fallback (video, audio) URLs, handed to the player on the next poll.
@@ -185,6 +224,7 @@ struct AppView {
     address: Entity<TextInput>,
     address_error: Option<SharedString>,
     address_focused: bool,
+    viewport_h: f32,
     focus: FocusHandle,
     slot: Rc<RefCell<PlayerSlot>>,
     /// Bumped on every navigation so results of stale async work are dropped.
@@ -196,6 +236,17 @@ struct AppView {
     decoder: Option<String>,
     /// Width / height of the current video; the player frame takes this shape.
     video_aspect: Option<f32>,
+    /// Streams available for the current video (None when yt-dlp had to resolve them).
+    catalog: Option<Rc<StreamCatalog>>,
+    video_itag: Option<u32>,
+    audio_itag: Option<u32>,
+    quality_auto: bool,
+    /// Playback speed; kept across videos like YouTube does.
+    rate: f64,
+    menu: Option<MenuPage>,
+    gear_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// Bumped whenever the player is rebuilt, so late fallback URLs for old streams are dropped.
+    stream_generation: u64,
     subscribed: bool,
     seek_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     _poll: Task<()>,
@@ -254,6 +305,7 @@ impl AppView {
             address,
             address_error: None,
             address_focused: false,
+            viewport_h: 0.0,
             focus,
             slot: Rc::default(),
             generation: 0,
@@ -263,6 +315,14 @@ impl AppView {
             stream_info: None,
             decoder: None,
             video_aspect: None,
+            catalog: None,
+            video_itag: None,
+            audio_itag: None,
+            quality_auto: true,
+            rate: 1.0,
+            menu: None,
+            gear_bounds: Rc::default(),
+            stream_generation: 0,
             subscribed: false,
             seek_bounds: Rc::default(),
             _poll: poll,
@@ -331,72 +391,83 @@ impl AppView {
         .detach();
 
         let max_height = self.settings.max_height;
-        let seek_fallback = self.settings.seek_fallback;
         let streams = self.youtube.streams(id.to_string(), max_height);
         cx.spawn(async move |this, cx| {
-            let (result, fallback_format) = match streams.await {
-                Ok(urls) => {
-                    let fallback_format = urls
-                        .video_itag
-                        .zip(urls.audio_itag)
-                        .filter(|_| seek_fallback)
-                        .map(|(v, a)| format!("{v}+{a}"));
-                    (Ok(urls), fallback_format)
-                }
+            let result = match streams.await {
+                Ok((urls, catalog)) => Ok((urls, Some(catalog))),
                 Err(rustypipe_err) => {
                     eprintln!("moth: RustyPipe stream resolution failed, trying yt-dlp: {rustypipe_err:#}");
                     let id = id.to_string();
-                    let result = cx
-                        .background_executor()
+                    cx.background_executor()
                         .spawn(async move { player::resolve_streams(&id, None, max_height) })
                         .await
                         .map(|mut urls| {
                             urls.info = format!("{} · via yt-dlp (RustyPipe failed)", urls.info);
-                            urls
+                            (urls, None)
                         })
-                        .map_err(|ytdlp_err| format!("RustyPipe: {rustypipe_err:#}\nyt-dlp: {ytdlp_err:#}"));
-                    (result, None)
+                        .map_err(|ytdlp_err| format!("RustyPipe: {rustypipe_err:#}\nyt-dlp: {ytdlp_err:#}"))
                 }
             };
-            let started = this
-                .update(cx, |this, cx| {
-                    if this.generation != generation {
-                        return false;
+            this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                match result {
+                    Ok((urls, catalog)) => {
+                        this.catalog = catalog.map(Rc::new);
+                        let start = (this.rate != 1.0).then_some(Start { position: 0, rate: this.rate, paused: false });
+                        this.begin_playback(urls, start, cx);
                     }
-                    let started = match result {
-                        Ok(urls) => {
-                            this.stream_info = Some(urls.info.clone());
-                            if let (Some(w), Some(h)) = (urls.width, urls.height)
-                                && w > 0
-                                && h > 0
-                            {
-                                this.video_aspect = Some(w as f32 / h as f32);
-                            }
-                            let mut slot = this.slot.borrow_mut();
-                            slot.pending = Some(urls);
-                            slot.fallback_pending = fallback_format.is_some();
-                            this.status = Status::Starting;
-                            true
-                        }
-                        Err(err) => {
-                            this.status = Status::Error(err);
-                            false
-                        }
-                    };
-                    cx.notify();
-                    started
-                })
-                .unwrap_or(false);
+                    Err(err) => {
+                        this.status = Status::Error(err);
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
 
-            // RustyPipe's iOS-client URLs can't seek far ahead; resolve web-client URLs for the
-            // very same files in the background so the player can switch over when it needs to.
-            let Some(format) = fallback_format.filter(|_| started) else { return };
+    /// Hand stream URLs to the video canvas (which builds the player on its next paint) and, if
+    /// enabled, resolve web-client URLs for the same files so seeking far ahead works.
+    fn begin_playback(&mut self, urls: StreamUrls, start: Option<Start>, cx: &mut Context<Self>) {
+        self.stream_generation += 1;
+        self.stream_info = Some(urls.info.clone());
+        self.video_itag = urls.video_itag;
+        self.audio_itag = urls.audio_itag;
+        self.decoder = None;
+        if let (Some(w), Some(h)) = (urls.width, urls.height)
+            && w > 0
+            && h > 0
+        {
+            self.video_aspect = Some(w as f32 / h as f32);
+        }
+        // RustyPipe's iOS-client URLs can't seek far ahead (see player.rs); only catalog streams
+        // have itags to ask yt-dlp for.
+        let fallback_format = urls
+            .video_itag
+            .zip(urls.audio_itag)
+            .filter(|_| self.settings.seek_fallback && self.catalog.is_some())
+            .map(|(video, audio)| format!("{video}+{audio}"));
+        // Replacing the slot drops (and stops) any current player.
+        *self.slot.borrow_mut() =
+            PlayerSlot { pending: Some(urls), start, fallback_pending: fallback_format.is_some(), ..Default::default() };
+        self.status = Status::Starting;
+        cx.notify();
+
+        let (Some(format), Route::Watch(id)) = (fallback_format, &self.route) else { return };
+        let id = id.to_string();
+        let max_height = self.settings.max_height;
+        let (generation, stream_generation) = (self.generation, self.stream_generation);
+        cx.spawn(async move |this, cx| {
             let fallback = cx
                 .background_executor()
                 .spawn(async move { player::resolve_streams(&id, Some(format), max_height) })
                 .await;
             this.update(cx, |this, _| {
-                if this.generation != generation {
+                if this.generation != generation || this.stream_generation != stream_generation {
                     return;
                 }
                 let mut slot = this.slot.borrow_mut();
@@ -411,6 +482,82 @@ impl AppView {
             .ok();
         })
         .detach();
+    }
+
+    /// Rebuild playback with other streams, resuming where we are.
+    fn switch_streams(&mut self, video_itag: u32, audio_itag: u32, cx: &mut Context<Self>) {
+        let Some(catalog) = self.catalog.clone() else { return };
+        if self.video_itag == Some(video_itag) && self.audio_itag == Some(audio_itag) {
+            return;
+        }
+        let (Some(video), Some(audio)) = (catalog.video_by_itag(video_itag), catalog.audio_by_itag(audio_itag))
+        else {
+            return;
+        };
+        let start = Start {
+            position: self.position.unwrap_or(0),
+            rate: self.rate,
+            paused: matches!(self.status, Status::Paused),
+        };
+        self.begin_playback(catalog.urls(video, audio), Some(start), cx);
+    }
+
+    fn menu_action(&mut self, action: MenuAction, cx: &mut Context<Self>) {
+        let catalog = self.catalog.clone();
+        let current_video = catalog.as_ref().zip(self.video_itag).and_then(|(c, itag)| c.video_by_itag(itag).cloned());
+        let current_audio = catalog.as_ref().zip(self.audio_itag).and_then(|(c, itag)| c.audio_by_itag(itag).cloned());
+        match action {
+            MenuAction::Open(page) => {
+                self.menu = Some(page);
+                cx.notify();
+                return;
+            }
+            MenuAction::Speed(rate) => {
+                self.rate = rate;
+                let mut slot = self.slot.borrow_mut();
+                if let Some(player) = slot.player.as_mut() {
+                    player.set_rate(rate);
+                } else if let Some(start) = slot.start.as_mut() {
+                    start.rate = rate;
+                } else if slot.pending.is_some() {
+                    slot.start = Some(Start { position: 0, rate, paused: false });
+                }
+            }
+            MenuAction::Quality(choice) => {
+                let (Some(catalog), Some(audio_itag)) = (catalog, self.audio_itag) else { return };
+                let codec = current_video.as_ref().map(|video| video.codec);
+                let video = match choice {
+                    None => catalog.auto_video(self.settings.max_height, codec),
+                    Some((resolution, fps)) => {
+                        let variants = catalog.video_variants(resolution, fps);
+                        variants.iter().find(|video| Some(video.codec) == codec).or(variants.first()).copied()
+                    }
+                };
+                self.quality_auto = choice.is_none();
+                if let Some(video) = video {
+                    self.switch_streams(video.itag, audio_itag, cx);
+                }
+            }
+            MenuAction::Video(itag) => {
+                if let Some(audio_itag) = self.audio_itag {
+                    self.switch_streams(itag, audio_itag, cx);
+                }
+            }
+            MenuAction::Audio(itag) => {
+                if let Some(video_itag) = self.video_itag {
+                    self.switch_streams(video_itag, itag, cx);
+                }
+            }
+            MenuAction::Track(track_id) => {
+                let (Some(catalog), Some(video_itag)) = (catalog, self.video_itag) else { return };
+                let codec = current_audio.as_ref().map(|audio| audio.codec);
+                let options = catalog.audio_in_track(Some(&track_id));
+                if let Some(audio) = options.iter().find(|audio| Some(audio.codec) == codec).or(options.first()) {
+                    self.switch_streams(video_itag, audio.itag, cx);
+                }
+            }
+        }
+        self.menu = None;
         cx.notify();
     }
 
@@ -471,6 +618,11 @@ impl AppView {
         self.stream_info = None;
         self.decoder = None;
         self.video_aspect = None;
+        self.catalog = None;
+        self.video_itag = None;
+        self.audio_itag = None;
+        self.quality_auto = true;
+        self.menu = None;
     }
 
     fn toggle_pause(&mut self, cx: &mut Context<Self>) {
@@ -516,7 +668,8 @@ impl AppView {
             changed = true;
         }
 
-        if let Some(player) = slot.player.as_ref() {
+        if let Some(player) = slot.player.as_mut() {
+            player.tick();
             for event in player.drain_events() {
                 self.status = match event {
                     PlayerEvent::Error(err) => Status::Error(err),
@@ -584,6 +737,11 @@ impl AppView {
         if !matches!(self.route, Route::Watch(_)) {
             return;
         }
+        if self.menu.is_some() && event.keystroke.key == "escape" {
+            self.menu = None;
+            cx.notify();
+            return;
+        }
         match event.keystroke.key.as_str() {
             "space" | "k" => self.toggle_pause(cx),
             "f" => window.toggle_fullscreen(),
@@ -639,6 +797,7 @@ impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport = window.viewport_size();
         self.address_focused = self.address.focus_handle(cx).is_focused(window);
+        self.viewport_h = f32::from(viewport.height);
         if matches!(self.route, Route::Watch(_)) && window.is_fullscreen() {
             return div()
                 .id("root")
@@ -846,11 +1005,14 @@ impl AppView {
     /// overlay the video yet: the waylandsink subsurface is stacked above the gpui surface.)
     fn watch_fullscreen(&self, w: f32, h: f32, cx: &mut Context<Self>) -> impl IntoElement {
         const BAR_H: f32 = 52.0;
+        // The video layer covers anything drawn over it, so an open menu gets its own space.
+        let menu_room = self.menu.map_or(0.0, |_| (self.menu_height() + 16.0).min(h * 0.6));
         div()
             .size_full()
             .flex()
             .flex_col()
-            .child(self.video_surface(w, (h - BAR_H).max(0.0), cx))
+            .child(self.video_surface(w, (h - BAR_H - menu_room).max(0.0), cx))
+            .when(menu_room > 0.0, |column| column.child(div().h(px(menu_room)).flex_none()))
             .child(
                 div()
                     .h(px(BAR_H))
@@ -910,8 +1072,9 @@ impl AppView {
                             player.set_rect(rect);
                         } else if let Some(urls) = slot.pending.take() {
                             let fallback_pending = slot.fallback_pending;
+                            let start = slot.start.take();
                             let result = wayland_handles(window).and_then(|(display, surface)| {
-                                Player::new(&urls, fallback_pending, &http, display, surface, rect)
+                                Player::new(&urls, start, fallback_pending, &http, display, surface, rect)
                             });
                             match result {
                                 Ok(player) => slot.player = Some(player),
@@ -923,6 +1086,250 @@ impl AppView {
                 .absolute()
                 .size_full(),
             )
+    }
+
+    fn menu_items(&self, page: MenuPage) -> Vec<MenuItem> {
+        let catalog = self.catalog.as_deref();
+        let video = catalog.zip(self.video_itag).and_then(|(c, itag)| c.video_by_itag(itag));
+        let audio = catalog.zip(self.audio_itag).and_then(|(c, itag)| c.audio_by_itag(itag));
+        let item = |label: String, detail: Option<String>, selected: bool, action: MenuAction| MenuItem {
+            label,
+            detail,
+            selected,
+            action,
+        };
+        match page {
+            MenuPage::Main => {
+                let mut items = Vec::new();
+                if let (Some(catalog), Some(video), Some(audio)) = (catalog, video, audio) {
+                    let quality = if self.quality_auto { format!("Auto ({})", video.label()) } else { video.label() };
+                    items.push(item("Quality".into(), Some(quality), false, MenuAction::Open(MenuPage::Quality)));
+                    items.push(item(
+                        "Video format".into(),
+                        Some(video.codec.into()),
+                        false,
+                        MenuAction::Open(MenuPage::Format),
+                    ));
+                    if catalog.tracks().len() > 1 {
+                        let track = audio.track.as_ref().map_or("Default".to_string(), |track| track.name.clone());
+                        items.push(item("Audio track".into(), Some(track), false, MenuAction::Open(MenuPage::Track)));
+                    }
+                    items.push(item(
+                        "Audio quality".into(),
+                        Some(audio.label()),
+                        false,
+                        MenuAction::Open(MenuPage::Audio),
+                    ));
+                }
+                items.push(item(
+                    "Playback speed".into(),
+                    Some(speed_label(self.rate)),
+                    false,
+                    MenuAction::Open(MenuPage::Speed),
+                ));
+                items
+            }
+            MenuPage::Quality => {
+                let Some(catalog) = catalog else { return Vec::new() };
+                let current = video.map(|video| (video.resolution(), video.fps));
+                let mut items = vec![item(
+                    "Auto".into(),
+                    Some(format!("up to {}p", self.settings.max_height)),
+                    self.quality_auto,
+                    MenuAction::Quality(None),
+                )];
+                items.extend(catalog.qualities().into_iter().map(|(resolution, fps)| {
+                    let label = if fps > 30 { format!("{resolution}p{fps}") } else { format!("{resolution}p") };
+                    let badge = match resolution {
+                        2160.. => Some("4K".to_string()),
+                        1440.. => Some("QHD".to_string()),
+                        720.. => Some("HD".to_string()),
+                        _ => None,
+                    };
+                    item(
+                        label,
+                        badge,
+                        !self.quality_auto && current == Some((resolution, fps)),
+                        MenuAction::Quality(Some((resolution, fps))),
+                    )
+                }));
+                items
+            }
+            MenuPage::Format => {
+                let (Some(catalog), Some(video)) = (catalog, video) else { return Vec::new() };
+                catalog
+                    .video_variants(video.resolution(), video.fps)
+                    .into_iter()
+                    .map(|variant| {
+                        item(
+                            variant.codec.into(),
+                            Some(format!("{:.1} Mbps", variant.bitrate as f64 / 1e6)),
+                            variant.itag == video.itag,
+                            MenuAction::Video(variant.itag),
+                        )
+                    })
+                    .collect()
+            }
+            MenuPage::Track => {
+                let Some(catalog) = catalog else { return Vec::new() };
+                let current = audio.and_then(|audio| audio.track.as_ref()).map(|track| track.id.clone());
+                catalog
+                    .tracks()
+                    .into_iter()
+                    .map(|track| {
+                        item(
+                            track.name.clone(),
+                            track.is_default.then(|| "default".to_string()),
+                            current.as_ref() == Some(&track.id),
+                            MenuAction::Track(track.id),
+                        )
+                    })
+                    .collect()
+            }
+            MenuPage::Audio => {
+                let Some(catalog) = catalog else { return Vec::new() };
+                let track = audio.and_then(|audio| audio.track.as_ref()).map(|track| track.id.as_str());
+                catalog
+                    .audio_in_track(track)
+                    .into_iter()
+                    .map(|option| {
+                        item(option.label(), None, Some(option.itag) == self.audio_itag, MenuAction::Audio(option.itag))
+                    })
+                    .collect()
+            }
+            MenuPage::Speed => SPEEDS
+                .iter()
+                .map(|rate| item(speed_label(*rate), None, (rate - self.rate).abs() < 1e-9, MenuAction::Speed(*rate)))
+                .collect(),
+        }
+    }
+
+    fn menu_height(&self) -> f32 {
+        let Some(page) = self.menu else { return 0.0 };
+        let header = if page == MenuPage::Main { 0.0 } else { MENU_HEADER_H };
+        header + self.menu_items(page).len() as f32 * MENU_ROW_H + 16.0
+    }
+
+    /// YouTube-style settings popover, attached to the gear button. In a window it opens
+    /// downward (the video layer would hide anything drawn over the video); in fullscreen the
+    /// video makes room for it above the control bar.
+    fn settings_menu(&self, fullscreen: bool, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let page = self.menu?;
+        let gear = self.gear_bounds.get()?;
+        let items = self.menu_items(page);
+        let max_list_h = if fullscreen {
+            (self.viewport_h * 0.6 - MENU_HEADER_H).max(MENU_ROW_H * 3.0)
+        } else {
+            let below = self.viewport_h - f32::from(gear.bottom()) - 24.0;
+            (below - MENU_HEADER_H - 16.0).max(MENU_ROW_H * 3.0)
+        };
+        let title = match page {
+            MenuPage::Main => None,
+            MenuPage::Quality => Some("Quality"),
+            MenuPage::Format => Some("Video format"),
+            MenuPage::Track => Some("Audio track"),
+            MenuPage::Audio => Some("Audio quality"),
+            MenuPage::Speed => Some("Playback speed"),
+        };
+        let gear_bounds = self.gear_bounds.clone();
+
+        let rows: Vec<_> = items
+            .into_iter()
+            .enumerate()
+            .map(|(ix, entry)| {
+                let submenu = matches!(entry.action, MenuAction::Open(_));
+                let action = entry.action;
+                div()
+                    .id(("menu-item", ix))
+                    .h(px(MENU_ROW_H))
+                    .flex_none()
+                    .px_4()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(HOVER)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.menu_action(action.clone(), cx)))
+                    .when(page != MenuPage::Main, |row| {
+                        row.child(
+                            div()
+                                .w(px(14.0))
+                                .flex_none()
+                                .text_sm()
+                                .text_color(rgb(ACCENT))
+                                .child(if entry.selected { "✓" } else { "" }),
+                        )
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .text_color(rgb(TEXT))
+                            .when(entry.selected, |label| label.font_weight(FontWeight::SEMIBOLD))
+                            .truncate()
+                            .child(entry.label),
+                    )
+                    .when_some(entry.detail, |row, detail| {
+                        row.child(div().flex_none().text_xs().text_color(rgb(MUTED)).child(detail))
+                    })
+                    .when(submenu, |row| row.child(div().flex_none().text_sm().text_color(rgb(FAINT)).child("›")))
+            })
+            .collect();
+
+        let menu = div()
+            .id("player-settings-menu")
+            .w(px(MENU_W))
+            .py_2()
+            .rounded_xl()
+            .bg(rgba(0x141a2cf7))
+            .border_1()
+            .border_color(rgb(TRACK))
+            .shadow_lg()
+            .occlude()
+            .on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                // Clicks on the gear toggle the menu themselves.
+                if gear_bounds.get().is_some_and(|bounds| bounds.contains(&event.position)) {
+                    return;
+                }
+                this.menu = None;
+                cx.notify();
+            }))
+            .when_some(title, |menu, title| {
+                menu.child(
+                    div()
+                        .id("menu-back")
+                        .h(px(MENU_HEADER_H - 8.0))
+                        .mb_2()
+                        .px_4()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .cursor_pointer()
+                        .border_b_1()
+                        .border_color(rgb(TRACK))
+                        .hover(|style| style.bg(rgb(HOVER)))
+                        .on_click(cx.listener(|this, _, _, cx| this.menu_action(MenuAction::Open(MenuPage::Main), cx)))
+                        .child(div().text_color(rgb(MUTED)).child("‹"))
+                        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(title)),
+                )
+            })
+            .child(
+                div()
+                    .id("menu-rows")
+                    .max_h(px(max_list_h))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .children(rows),
+            );
+
+        let (corner, anchor, offset) = if fullscreen {
+            (gpui::Anchor::TopRight, gpui::Anchor::BottomRight, point(px(0.0), px(-8.0)))
+        } else {
+            (gpui::Anchor::BottomRight, gpui::Anchor::TopRight, point(px(0.0), px(8.0)))
+        };
+        Some(deferred(anchored().attach(gear, corner).anchor(anchor).offset(offset).child(menu)).with_priority(1))
     }
 
     fn playback_error(&self) -> Option<impl IntoElement + use<>> {
@@ -1017,6 +1424,33 @@ impl AppView {
                             ),
                     ),
             )
+            .child({
+                let gear_bounds = self.gear_bounds.clone();
+                let open = self.menu.is_some();
+                div()
+                    .id("player-settings")
+                    .relative()
+                    .size(px(34.0))
+                    .flex_none()
+                    .rounded_full()
+                    .when(open, |button| button.bg(rgb(HOVER)))
+                    .hover(|style| style.bg(rgb(HOVER)))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.menu = if this.menu.is_some() { None } else { Some(MenuPage::Main) };
+                        cx.notify();
+                    }))
+                    .child(icon(Icon::Settings, 17.0, rgb(if open { TEXT } else { MUTED }).into()))
+                    .child(
+                        canvas(move |bounds, _, _| gear_bounds.set(Some(bounds)), |_, _, _, _| {})
+                            .absolute()
+                            .size_full(),
+                    )
+                    .when_some(self.settings_menu(fullscreen, cx), |button, menu| button.child(menu))
+            })
             .child(
                 div()
                     .id("fullscreen")

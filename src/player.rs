@@ -125,11 +125,22 @@ pub enum PlayerEvent {
     Eos,
 }
 
+/// Where a (re)built pipeline should begin: used when switching streams mid-video.
+#[derive(Clone, Copy, Debug)]
+pub struct Start {
+    pub position: u64,
+    pub rate: f64,
+    pub paused: bool,
+}
+
 pub struct Player {
     pipeline: gst::Pipeline,
     sink: gst::Element,
     rect: Rect,
     paused: bool,
+    rate: f64,
+    /// Applied once the pipeline has prerolled.
+    pending_start: Option<Start>,
     video_source: Arc<Mutex<Source>>,
     audio_source: Arc<Mutex<Source>>,
 }
@@ -142,6 +153,7 @@ impl Player {
     /// delivered through [`Player::set_fallback`] (or [`Player::fallback_failed`]).
     pub fn new(
         urls: &StreamUrls,
+        start: Option<Start>,
         fallback_pending: bool,
         http: &Http,
         display: *mut c_void,
@@ -167,16 +179,20 @@ impl Player {
         let adecode = make("decodebin3")?;
         let aqueue = make("queue")?;
         let aconvert = make("audioconvert")?;
+        // Keeps the pitch natural when playing faster or slower.
+        let tempo = make("scaletempo")?;
+        let aconvert_out = make("audioconvert")?;
         let aresample = make("audioresample")?;
         let asink = make("pipewiresink")?;
 
         pipeline.add_many([
-            &vsrc, &vdecode, &vqueue, &sink, &asrc, &adecode, &aqueue, &aconvert, &aresample, &asink,
+            &vsrc, &vdecode, &vqueue, &sink, &asrc, &adecode, &aqueue, &aconvert, &tempo, &aconvert_out,
+            &aresample, &asink,
         ])?;
         vsrc.link(&vdecode)?;
         asrc.link(&adecode)?;
         gst::Element::link_many([&vqueue, &sink])?;
-        gst::Element::link_many([&aqueue, &aconvert, &aresample, &asink])?;
+        gst::Element::link_many([&aqueue, &aconvert, &tempo, &aconvert_out, &aresample, &asink])?;
         link_decoded_pad(&vdecode, &vqueue, "video_");
         link_decoded_pad(&adecode, &aqueue, "audio_");
 
@@ -193,10 +209,65 @@ impl Player {
         overlay.set_render_rectangle(rect.x, rect.y, rect.w, rect.h)?;
 
         pipeline
-            .set_state(gst::State::Playing)
+            // With a start position, preroll paused first so the seek lands before anything plays.
+            .set_state(if start.is_some() { gst::State::Paused } else { gst::State::Playing })
             .context("failed to start pipeline")?;
 
-        Ok(Self { pipeline, sink, rect, paused: false, video_source, audio_source })
+        Ok(Self {
+            pipeline,
+            sink,
+            rect,
+            paused: start.is_some_and(|start| start.paused),
+            rate: start.map_or(1.0, |start| start.rate),
+            pending_start: start,
+            video_source,
+            audio_source,
+        })
+    }
+
+    /// Call regularly: applies the start position once the pipeline has prerolled.
+    pub fn tick(&mut self) {
+        let Some(start) = self.pending_start else { return };
+        let (_, current, pending) = self.pipeline.state(gst::ClockTime::ZERO);
+        if current < gst::State::Paused || pending != gst::State::VoidPending {
+            return;
+        }
+        self.pending_start = None;
+        self.seek_to(start.position);
+        if !start.paused {
+            self.pipeline.set_state(gst::State::Playing).ok();
+        }
+    }
+
+    /// Change the playback speed, keeping the current position.
+    pub fn set_rate(&mut self, rate: f64) {
+        if let Some(start) = self.pending_start.as_mut() {
+            start.rate = rate;
+            self.rate = rate;
+            return;
+        }
+        self.rate = rate;
+        if let Some(position) = self.pipeline.query_position::<gst::ClockTime>() {
+            self.seek_clock(position);
+        }
+    }
+
+    fn seek_to(&self, seconds: u64) {
+        self.seek_clock(gst::ClockTime::from_seconds(seconds));
+    }
+
+    fn seek_clock(&self, position: gst::ClockTime) {
+        let result = self.pipeline.seek(
+            self.rate,
+            gst::SeekFlags::FLUSH | gst::SeekFlags::ACCURATE,
+            gst::SeekType::Set,
+            Some(position),
+            gst::SeekType::None,
+            gst::ClockTime::NONE,
+        );
+        if let Err(err) = result {
+            eprintln!("moth: seek failed: {err}");
+        }
     }
 
     pub fn set_fallback(&self, video: String, audio: String) {
@@ -250,10 +321,7 @@ impl Player {
     }
 
     pub fn seek_seconds(&self, seconds: u64) {
-        let _ = self.pipeline.seek_simple(
-            gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
-            gst::ClockTime::from_seconds(seconds),
-        );
+        self.seek_to(seconds);
     }
 
     pub fn drain_events(&self) -> Vec<PlayerEvent> {

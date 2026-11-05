@@ -8,12 +8,9 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use rustypipe::client::RustyPipe;
 use rustypipe::model::richtext::ToPlaintext as _;
 use rustypipe::model::{AudioCodec, AudioStream, Thumbnail, UrlTarget, VideoCodec, VideoItem, VideoPlayer};
-use rustypipe::param::StreamFilter;
 
 use crate::player::StreamUrls;
 
-/// Preferred order: VP9 and AV1 are hardware-decodable on current GPUs; H.264 is the last resort.
-const VIDEO_CODECS: [VideoCodec; 3] = [VideoCodec::Vp9, VideoCodec::Av01, VideoCodec::Avc1];
 
 pub struct WatchPage {
     pub title: String,
@@ -113,12 +110,24 @@ impl YouTube {
         })
     }
 
-    /// Resolve playable stream URLs: best video-only stream up to `max_height` plus the best Opus audio.
-    pub fn streams(&self, video_id: String, max_height: u32) -> impl Future<Output = Result<StreamUrls>> + use<> {
+    /// Every playable stream of a video, plus the automatic pick (best video up to `max_height`,
+    /// best Opus audio in the default track).
+    pub fn streams(
+        &self,
+        video_id: String,
+        max_height: u32,
+    ) -> impl Future<Output = Result<(StreamUrls, StreamCatalog)>> + use<> {
         let client = self.client.clone();
         self.run(async move {
             let player = client.query().player(&video_id).await?;
-            select_streams(&player, max_height)
+            if player.details.is_live {
+                bail!("Live streams aren't supported yet");
+            }
+            let catalog = StreamCatalog::from_player(&player);
+            let video = catalog.auto_video(max_height, None).ok_or_else(|| anyhow!("no playable video stream"))?;
+            let audio = catalog.auto_audio(None).ok_or_else(|| anyhow!("no playable audio stream"))?;
+            let urls = catalog.urls(video, audio);
+            Ok((urls, catalog))
         })
     }
 
@@ -135,49 +144,218 @@ impl YouTube {
     }
 }
 
-fn select_streams(player: &VideoPlayer, max_height: u32) -> Result<StreamUrls> {
-    if player.details.is_live {
-        bail!("Live streams aren't supported yet");
+#[derive(Clone, Debug)]
+pub struct VideoOption {
+    pub itag: u32,
+    pub url: String,
+    /// YouTube's own label, e.g. "1080p60" (also for ultra-wide 2048x858 streams).
+    pub quality: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u8,
+    pub codec: &'static str,
+    /// Average bitrate in bits per second.
+    pub bitrate: u32,
+    pub size: Option<u64>,
+}
+
+impl VideoOption {
+    /// Resolution class as YouTube names it ("1080" for 1920x1080, 2048x858 and 1080x1920).
+    pub fn resolution(&self) -> u32 {
+        let digits: String = self.quality.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().unwrap_or_else(|_| self.width.min(self.height))
     }
-    let video = VIDEO_CODECS
-        .iter()
-        .find_map(|codec| {
-            let filter = StreamFilter::new().video_max_res(max_height).video_codecs([*codec]);
-            player.select_video_only_stream(&filter)
-        })
-        .ok_or_else(|| anyhow!("no playable video stream"))?;
-    // The iOS client also lists "stable volume" (DRC) re-encodes under the same itags. Skip them:
-    // they're not what YouTube plays by default, and the regular files are byte-identical to
-    // the web client's, which the player falls back to for seeking.
-    let regular = |stream: &&AudioStream| !stream.url.contains("drc%3D1");
-    let audio = [Some(AudioCodec::Opus), None]
-        .into_iter()
-        .find_map(|codec| {
-            player
-                .audio_streams
-                .iter()
-                .filter(regular)
-                .filter(|stream| codec.is_none_or(|codec| stream.codec == codec))
-                .max_by_key(|stream| stream.average_bitrate)
-        })
-        .ok_or_else(|| anyhow!("no playable audio stream"))?;
-    Ok(StreamUrls {
-        video: video.url.clone(),
-        audio: audio.url.clone(),
-        video_size: video.size,
-        audio_size: Some(audio.size),
-        video_bitrate: Some(video.average_bitrate),
-        audio_bitrate: Some(audio.average_bitrate),
-        video_itag: Some(video.itag),
-        audio_itag: Some(audio.itag),
-        width: Some(video.width),
-        height: Some(video.height),
-        info: format!(
-            "{:?} {}x{}@{} · {:?} · via RustyPipe ({:?} client)",
-            video.codec, video.width, video.height, video.fps, audio.codec, player.client_type
-        )
-        .to_lowercase(),
-    })
+
+    /// e.g. "1080p60", "720p".
+    pub fn label(&self) -> String {
+        match self.fps {
+            fps if fps > 30 => format!("{}p{fps}", self.resolution()),
+            _ => format!("{}p", self.resolution()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioTrackInfo {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioOption {
+    pub itag: u32,
+    pub url: String,
+    pub codec: &'static str,
+    /// Average bitrate in bits per second.
+    pub bitrate: u32,
+    pub size: u64,
+    pub track: Option<AudioTrackInfo>,
+}
+
+impl AudioOption {
+    /// e.g. "Opus · 135 kbps".
+    pub fn label(&self) -> String {
+        format!("{} · {} kbps", self.codec, (self.bitrate + 500) / 1000)
+    }
+}
+
+/// All streams of one video that moth can play.
+#[derive(Clone, Debug, Default)]
+pub struct StreamCatalog {
+    pub video: Vec<VideoOption>,
+    pub audio: Vec<AudioOption>,
+    client: String,
+}
+
+/// Preference order: VP9 and AV1 are hardware-decodable on current GPUs; H.264 is the last resort.
+const CODEC_ORDER: [&str; 3] = ["VP9", "AV1", "H.264"];
+
+impl StreamCatalog {
+    fn from_player(player: &VideoPlayer) -> Self {
+        let video = player
+            .video_only_streams
+            .iter()
+            .filter(|stream| !stream.hdr && stream.drm_track_type.is_none())
+            .filter_map(|stream| {
+                let codec = match stream.codec {
+                    VideoCodec::Vp9 => "VP9",
+                    VideoCodec::Av01 => "AV1",
+                    VideoCodec::Avc1 => "H.264",
+                    _ => return None,
+                };
+                Some(VideoOption {
+                    itag: stream.itag,
+                    url: stream.url.clone(),
+                    quality: stream.quality.clone(),
+                    width: stream.width,
+                    height: stream.height,
+                    fps: stream.fps,
+                    codec,
+                    bitrate: stream.average_bitrate,
+                    size: stream.size,
+                })
+            })
+            .collect();
+        // The iOS client also lists "stable volume" (DRC) re-encodes under the same itags. Skip them:
+        // they're not what YouTube plays by default, and the regular files are byte-identical to
+        // the web client's, which the player falls back to for seeking.
+        let audio = player
+            .audio_streams
+            .iter()
+            .filter(|stream: &&AudioStream| !stream.url.contains("drc%3D1") && stream.drm_track_type.is_none())
+            .filter_map(|stream| {
+                let codec = match stream.codec {
+                    AudioCodec::Opus => "Opus",
+                    AudioCodec::Mp4a => "AAC",
+                    _ => return None,
+                };
+                Some(AudioOption {
+                    itag: stream.itag,
+                    url: stream.url.clone(),
+                    codec,
+                    bitrate: stream.average_bitrate,
+                    size: stream.size,
+                    track: stream.track.as_ref().map(|track| AudioTrackInfo {
+                        id: track.id.clone(),
+                        name: track.lang_name.clone(),
+                        is_default: track.is_default,
+                    }),
+                })
+            })
+            .collect();
+        Self { video, audio, client: format!("{:?}", player.client_type).to_lowercase() }
+    }
+
+    fn codec_rank(codec: &str) -> usize {
+        CODEC_ORDER.iter().position(|c| *c == codec).unwrap_or(CODEC_ORDER.len())
+    }
+
+    /// Best stream at or below `max_height`, preferring `codec` (if given) and then the usual
+    /// codec order; if nothing is that small, the smallest stream.
+    pub fn auto_video(&self, max_height: u32, codec: Option<&str>) -> Option<&VideoOption> {
+        let rank = |option: &VideoOption| (Some(option.codec) != codec, Self::codec_rank(option.codec));
+        let fitting = self.video.iter().filter(|option| option.resolution() <= max_height);
+        let best_resolution = fitting.clone().map(|option| (option.resolution(), option.fps)).max();
+        match best_resolution {
+            Some(best) => fitting
+                .filter(|option| (option.resolution(), option.fps) == best)
+                .min_by_key(|option| rank(option)),
+            None => self.video.iter().min_by_key(|option| (option.resolution(), rank(option))),
+        }
+    }
+
+    /// Video options with the given resolution and frame rate, best codec first.
+    pub fn video_variants(&self, resolution: u32, fps: u8) -> Vec<&VideoOption> {
+        let mut variants: Vec<_> =
+            self.video.iter().filter(|option| option.resolution() == resolution && option.fps == fps).collect();
+        variants.sort_by_key(|option| Self::codec_rank(option.codec));
+        variants
+    }
+
+    /// Distinct (resolution, fps) pairs, highest first.
+    pub fn qualities(&self) -> Vec<(u32, u8)> {
+        let mut qualities: Vec<_> = self.video.iter().map(|option| (option.resolution(), option.fps)).collect();
+        qualities.sort_unstable_by(|a, b| b.cmp(a));
+        qualities.dedup();
+        qualities
+    }
+
+    pub fn tracks(&self) -> Vec<AudioTrackInfo> {
+        let mut tracks: Vec<AudioTrackInfo> = Vec::new();
+        for track in self.audio.iter().filter_map(|option| option.track.clone()) {
+            if !tracks.iter().any(|known| known.id == track.id) {
+                tracks.push(track);
+            }
+        }
+        tracks.sort_by_key(|track| !track.is_default);
+        tracks
+    }
+
+    /// Audio options in a track (the default track if `track_id` is `None`), best first.
+    pub fn audio_in_track(&self, track_id: Option<&str>) -> Vec<&AudioOption> {
+        let default_id = self.tracks().into_iter().find(|track| track.is_default).map(|track| track.id);
+        let wanted = track_id.map(str::to_string).or(default_id);
+        let mut options: Vec<_> = self
+            .audio
+            .iter()
+            .filter(|option| wanted.is_none() || option.track.as_ref().map(|track| &track.id) == wanted.as_ref())
+            .collect();
+        options.sort_by_key(|option| (option.codec != "Opus", std::cmp::Reverse(option.bitrate)));
+        options
+    }
+
+    /// Best audio (Opus preferred) in a track (the default track if `None`).
+    pub fn auto_audio(&self, track_id: Option<&str>) -> Option<&AudioOption> {
+        self.audio_in_track(track_id).into_iter().next()
+    }
+
+    pub fn video_by_itag(&self, itag: u32) -> Option<&VideoOption> {
+        self.video.iter().find(|option| option.itag == itag)
+    }
+
+    pub fn audio_by_itag(&self, itag: u32) -> Option<&AudioOption> {
+        self.audio.iter().find(|option| option.itag == itag)
+    }
+
+    pub fn urls(&self, video: &VideoOption, audio: &AudioOption) -> StreamUrls {
+        StreamUrls {
+            video: video.url.clone(),
+            audio: audio.url.clone(),
+            video_size: video.size,
+            audio_size: Some(audio.size),
+            video_bitrate: Some(video.bitrate),
+            audio_bitrate: Some(audio.bitrate),
+            video_itag: Some(video.itag),
+            audio_itag: Some(audio.itag),
+            width: Some(video.width),
+            height: Some(video.height),
+            info: format!(
+                "{} {}x{}@{} · {} · via RustyPipe ({} client)",
+                video.codec, video.width, video.height, video.fps, audio.label(), self.client
+            ),
+        }
+    }
 }
 
 fn related_video(item: VideoItem) -> RelatedVideo {
@@ -259,6 +437,32 @@ fn month_abbrev(month: u8) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Network test: `cargo test --release -- --ignored --nocapture catalog`
+    #[test]
+    #[ignore]
+    fn catalog_from_live_videos() {
+        let youtube = YouTube::new().expect("client");
+        for id in ["WhWc3b3KhnY", "0e3GPea1Tyg"] {
+            let (urls, catalog) = youtube.runtime.block_on(youtube.streams(id.to_string(), 720)).expect("streams");
+            println!("== {id}: auto = {}", urls.info);
+            println!("   qualities: {:?}", catalog.qualities());
+            let auto = catalog.auto_video(720, None).expect("auto video");
+            assert!(auto.resolution() <= 720);
+            let variants = catalog.video_variants(auto.resolution(), auto.fps);
+            println!("   formats at {}: {:?}", auto.label(), variants.iter().map(|v| (v.codec, v.itag)).collect::<Vec<_>>());
+            let tracks = catalog.tracks();
+            println!("   audio tracks ({}): {:?}", tracks.len(), tracks.iter().take(6).map(|t| (&t.name, t.is_default)).collect::<Vec<_>>());
+            let audio = catalog.audio_in_track(None);
+            println!("   audio (default track): {:?}", audio.iter().map(|a| a.label()).collect::<Vec<_>>());
+            assert_eq!(audio.first().map(|a| a.codec), Some("Opus"));
+            if let Some(other) = tracks.iter().find(|t| !t.is_default) {
+                let options = catalog.audio_in_track(Some(&other.id));
+                assert!(!options.is_empty() && options.iter().all(|a| a.track.as_ref().map(|t| &t.id) == Some(&other.id)));
+                println!("   audio ({}): {:?}", other.name, options.iter().map(|a| a.label()).collect::<Vec<_>>());
+            }
+        }
+    }
 
     #[test]
     fn counts() {
