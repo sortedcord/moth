@@ -7,7 +7,8 @@
 //! Some servers stop serving part-way (YouTube's iOS-client URLs only serve a little ahead of
 //! real-time playback, so a long seek gets a 403). If the stream has an alternate URL for the same
 //! bytes, a refused request switches to it and carries on; while one is still being resolved, the
-//! request waits for it a while.
+//! request waits for it a while. With no other URL to turn to, it tries again a few times before
+//! playback fails, since servers also refuse for reasons that pass.
 //!
 //! Seeking is normally the demuxer's job: it works out which bytes it wants next and the source
 //! just serves them. Fragmented MP4 is the exception. `qtdemux` refuses to seek in one that comes
@@ -39,8 +40,14 @@ const CHUNK_DURATION: Duration = Duration::from_secs(10);
 /// How far into a file to look for a segment index. The index of a ten-hour video is about
 /// 100 KiB, and it sits right after the (small) movie header.
 const MAX_HEADER_BYTES: u64 = 4 << 20;
-/// How long a refused request waits for an alternate URL that's still being resolved.
-const ALTERNATE_WAIT: Duration = Duration::from_secs(20);
+/// How long a refused request waits for an alternate URL that's still being resolved. That can
+/// take a while (for YouTube: a yt-dlp run, then however long YouTube holds the URLs back).
+const ALTERNATE_WAIT: Duration = Duration::from_secs(45);
+/// A refused request with no other URL to turn to is tried again this often, this far apart.
+const REFUSED_RETRIES: u32 = 3;
+const REFUSED_RETRY_PAUSE: Duration = Duration::from_secs(1);
+/// How often a waiting request checks whether it's still wanted.
+const WAIT_STEP: Duration = Duration::from_millis(100);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// Name of the bus message a source posts once it can be started.
 const READY_MESSAGE: &str = "moth-source-ready";
@@ -93,6 +100,14 @@ enum Fetched {
     Data(Vec<u8>),
     PastEnd,
     Forbidden,
+}
+
+/// What a refused request can do next.
+enum Refused {
+    /// The endpoint now has another URL to try.
+    Switched,
+    NoAlternate,
+    Abandoned,
 }
 
 /// What became of a request for a byte range.
@@ -238,9 +253,9 @@ impl Fetcher {
     }
 
     /// Fetch bytes `start..=end` (fewer at the end of the file), switching to the alternate URL
-    /// if the server refuses. Blocking. Gives up between attempts once `abandoned` says so.
+    /// if the server refuses. Blocking; `abandoned` is checked while waiting, to give up early.
     fn fetch(&self, start: u64, end: u64, abandoned: impl Fn() -> bool) -> Result<Range> {
-        let waiting_since = Instant::now();
+        let mut retries = 0;
         loop {
             let location = lock(&self.endpoint).location.clone();
             let requested_at = Instant::now();
@@ -249,10 +264,23 @@ impl Fetcher {
             match fetched {
                 Fetched::Data(bytes) => return Ok(Range::Data(bytes)),
                 Fetched::PastEnd => return Ok(Range::PastEnd),
-                Fetched::Forbidden => self.switch_or_wait(waiting_since, start, end)?,
+                Fetched::Forbidden => {}
             }
-            if abandoned() {
-                return Ok(Range::Abandoned);
+            match self.switch_to_alternate(start, &abandoned) {
+                Refused::Switched => retries = 0,
+                Refused::NoAlternate if retries < REFUSED_RETRIES => {
+                    if retries == 0 {
+                        eprintln!("moth: refused at byte {start}, with no other URL to try; trying again");
+                    }
+                    retries += 1;
+                    if !pause(REFUSED_RETRY_PAUSE, &abandoned) {
+                        return Ok(Range::Abandoned);
+                    }
+                }
+                Refused::NoAlternate => {
+                    bail!("the server refused bytes {start}-{end} of {} (HTTP 403)", describe(&location.url))
+                }
+                Refused::Abandoned => return Ok(Range::Abandoned),
             }
         }
     }
@@ -271,33 +299,61 @@ impl Fetcher {
         }
     }
 
-    /// After a refused request: switch to the alternate URL, wait for it, or give up.
-    fn switch_or_wait(&self, waiting_since: Instant, start: u64, end: u64) -> Result<()> {
-        let mut endpoint = lock(&self.endpoint);
-        match std::mem::replace(&mut endpoint.alternate, Alternate::Unavailable) {
-            Alternate::Ready(location) => {
-                eprintln!(
-                    "moth: refused at byte {start}; switching to the alternate URL ({}, {} headers)",
-                    describe(&location.url),
-                    location.headers.len()
-                );
-                endpoint.location = location;
-                endpoint.switched = true;
+    /// After a refused request: switch to the alternate URL, waiting for it while it's still
+    /// being resolved. Waiting, not asking the server again: it would only refuse again.
+    fn switch_to_alternate(&self, start: u64, abandoned: &impl Fn() -> bool) -> Refused {
+        let waiting_since = Instant::now();
+        loop {
+            {
+                let mut endpoint = lock(&self.endpoint);
+                match std::mem::replace(&mut endpoint.alternate, Alternate::Unavailable) {
+                    Alternate::Ready(location) => {
+                        eprintln!(
+                            "moth: refused at byte {start}; switching to the alternate URL ({}, {} headers)",
+                            describe(&location.url),
+                            location.headers.len()
+                        );
+                        endpoint.location = location;
+                        endpoint.switched = true;
+                        return Refused::Switched;
+                    }
+                    Alternate::Pending if waiting_since.elapsed() < ALTERNATE_WAIT => {
+                        endpoint.alternate = Alternate::Pending;
+                    }
+                    Alternate::Pending | Alternate::Unavailable => return Refused::NoAlternate,
+                }
             }
-            Alternate::Pending if waiting_since.elapsed() < ALTERNATE_WAIT => {
-                endpoint.alternate = Alternate::Pending;
-                drop(endpoint);
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            Alternate::Pending | Alternate::Unavailable => {
-                bail!("the server refused bytes {start}-{end} of {} (HTTP 403)", describe(&endpoint.location.url))
+            if !pause(WAIT_STEP, abandoned) {
+                return Refused::Abandoned;
             }
         }
-        Ok(())
     }
 }
 
-/// Feeds the started `appsrc`. Runs on its streaming thread, so blocking is fine.
+/// Sleep for `duration`, unless `abandoned` cuts it short: then return false.
+fn pause(duration: Duration, abandoned: &impl Fn() -> bool) -> bool {
+    let until = Instant::now() + duration;
+    loop {
+        if abandoned() {
+            return false;
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        std::thread::sleep(left.min(WAIT_STEP));
+    }
+}
+
+/// Whether the pipeline wants `appsrc` to stop what it's doing: it's flushing the source for a
+/// seek, or shutting it down. Both wait, on the UI thread, for the streaming thread to return
+/// from `need-data`. So that must not sit out a wait, least of all the one for an alternate URL,
+/// which the UI thread delivers.
+fn interrupted(appsrc: &gst_app::AppSrc) -> bool {
+    appsrc.static_pad("src").is_some_and(|pad| pad.pad_flags().contains(gst::PadFlags::FLUSHING))
+}
+
+/// Feeds the started `appsrc`. Runs on its streaming thread, so blocking on the network is fine.
 struct Feeder {
     fetcher: Fetcher,
     /// The beginning of the file, which `open` fetched: served from here rather than fetched
@@ -335,7 +391,7 @@ impl Feeder {
                 end = end.min(self.prefix.len() as u64 - 1);
                 rest[..(end - start + 1) as usize].to_vec()
             }
-            None => match self.fetcher.fetch(start, end, || lock(state).epoch != epoch || self.fetcher.closed())? {
+            None => match self.fetcher.fetch(start, end, || interrupted(appsrc) || self.fetcher.closed())? {
                 Range::Data(bytes) => bytes,
                 Range::PastEnd => {
                     mark_eos(state, epoch, appsrc);
