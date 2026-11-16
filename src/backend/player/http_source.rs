@@ -8,15 +8,24 @@
 //! real-time playback, so a long seek gets a 403). If the stream has an alternate URL for the same
 //! bytes, a refused request switches to it and carries on; while one is still being resolved, the
 //! request waits for it a while.
+//!
+//! Seeking is normally the demuxer's job: it works out which bytes it wants next and the source
+//! just serves them. Fragmented MP4 is the exception. `qtdemux` refuses to seek in one that comes
+//! as a byte stream, and expects its source to do it, as a DASH client would (see
+//! [`super::mp4_index`]). So for those the source works in time instead of bytes: asked for a
+//! position, it carries on from the fragment the position is in. Which of the two a stream needs
+//! shows in its first bytes, and an `appsrc` can't change its mind once started, so the source
+//! fetches those before it starts.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
+use super::mp4_index::{self, Probe};
 use super::stats::NetStats;
 use crate::backend::Http;
 use crate::backend::media::Location;
@@ -27,9 +36,14 @@ const MAX_CHUNK_BYTES: u64 = 1 << 20;
 const DEFAULT_CHUNK_BYTES: u64 = 512 << 10;
 /// Each request asks for about this much media, when the bitrate is known.
 const CHUNK_DURATION: Duration = Duration::from_secs(10);
+/// How far into a file to look for a segment index. The index of a ten-hour video is about
+/// 100 KiB, and it sits right after the (small) movie header.
+const MAX_HEADER_BYTES: u64 = 4 << 20;
 /// How long a refused request waits for an alternate URL that's still being resolved.
 const ALTERNATE_WAIT: Duration = Duration::from_secs(20);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Name of the bus message a source posts once it can be started.
+const READY_MESSAGE: &str = "moth-source-ready";
 
 pub enum Alternate {
     Unavailable,
@@ -44,12 +58,14 @@ pub struct Endpoint {
     /// Whether the alternate URL replaced the original.
     pub switched: bool,
     pub net: NetStats,
+    /// The player is gone: nobody is waiting for this stream any more.
+    pub closed: bool,
 }
 
 impl Endpoint {
     pub fn new(location: Location, alternate_pending: bool) -> Arc<Mutex<Self>> {
         let alternate = if alternate_pending { Alternate::Pending } else { Alternate::Unavailable };
-        Arc::new(Mutex::new(Self { location, alternate, switched: false, net: NetStats::default() }))
+        Arc::new(Mutex::new(Self { location, alternate, switched: false, net: NetStats::default(), closed: false }))
     }
 }
 
@@ -58,6 +74,9 @@ struct RangeState {
     /// Bumped on every seek, so a fetch that was in flight during the seek is discarded.
     epoch: u64,
     eos: bool,
+    /// Whether anything has been pushed yet. Until then the demuxer has nothing, so wherever
+    /// it's asked to start, the source starts with the beginning of the file.
+    started: bool,
 }
 
 /// Roughly `CHUNK_DURATION` of media when the bitrate (bits per second) is known.
@@ -76,41 +95,134 @@ enum Fetched {
     Forbidden,
 }
 
-pub fn element(http: Http, endpoint: Arc<Mutex<Endpoint>>, size: Option<u64>, bitrate: Option<u32>) -> gst::Element {
-    let chunk = chunk_size(bitrate);
-    let appsrc = gst_app::AppSrc::builder()
-        .stream_type(gst_app::AppStreamType::Seekable)
-        .format(gst::Format::Bytes)
-        .size(size.map_or(-1, |size| size as i64))
-        .max_bytes(2 * chunk)
-        .build();
-    let state = Arc::new(Mutex::new(RangeState { position: 0, epoch: 0, eos: false }));
-    let fetcher = Fetcher { http, endpoint, size, chunk };
+/// What became of a request for a byte range.
+enum Range {
+    Data(Vec<u8>),
+    PastEnd,
+    /// Nobody wants it any more (a seek, or the player shutting down).
+    Abandoned,
+}
 
+/// Add a source for `endpoint`'s stream to `pipeline`. It takes no part in the pipeline's state
+/// changes until it has seen the beginning of the stream: then it posts a message on the bus (see
+/// [`ready_source`]), and wants to be [`start`]ed.
+pub fn add_to(
+    pipeline: &gst::Pipeline,
+    http: Http,
+    endpoint: Arc<Mutex<Endpoint>>,
+    size: Option<u64>,
+    bitrate: Option<u32>,
+) -> Result<gst::Element> {
+    let chunk = chunk_size(bitrate);
+    let appsrc = gst_app::AppSrc::builder().stream_type(gst_app::AppStreamType::Seekable).max_bytes(2 * chunk).build();
+    // Not to be started before `open` knows which format it works in.
+    appsrc.set_locked_state(true);
+    pipeline.add(&appsrc)?;
+    let fetcher = Fetcher { http, endpoint, size, chunk };
+    // A thread of its own rather than the tokio runtime's: it blocks on the network, and nothing
+    // should have to wait for it when moth quits.
+    std::thread::Builder::new()
+        .name("moth-source".into())
+        .spawn({
+            let appsrc = appsrc.clone();
+            move || {
+                if let Err(err) = open(fetcher, &appsrc) {
+                    post_error(&appsrc, &err);
+                }
+            }
+        })
+        .context("failed to start a source thread")?;
+    Ok(appsrc.upcast())
+}
+
+fn post_error(appsrc: &gst_app::AppSrc, err: &anyhow::Error) {
+    eprintln!("moth: stream fetch failed: {err:#}");
+    let message = gst::message::Error::builder(gst::ResourceError::Read, &format!("{err:#}")).src(appsrc).build();
+    appsrc.post_message(message).ok();
+}
+
+/// Fetch the beginning of the stream, set the source up for what it turns out to be, and
+/// announce that it's ready.
+fn open(fetcher: Fetcher, appsrc: &gst_app::AppSrc) -> Result<()> {
+    let mut prefix = Vec::new();
+    let mut wanted = fetcher.chunk;
+    let index = loop {
+        let start = prefix.len() as u64;
+        let end = fetcher.size.map_or(wanted, |size| wanted.min(size)).max(start + 1) - 1;
+        match fetcher.fetch(start, end, || fetcher.closed())? {
+            Range::Data(bytes) => prefix.extend(bytes),
+            Range::PastEnd => break None,
+            Range::Abandoned => return Ok(()),
+        }
+        let complete = (prefix.len() as u64) <= end || fetcher.size.is_some_and(|size| prefix.len() as u64 >= size);
+        match mp4_index::probe(&prefix) {
+            Probe::Indexed(index) => break Some(index),
+            Probe::NeedsBytes(bytes) if !complete && bytes <= MAX_HEADER_BYTES => wanted = bytes.max(wanted),
+            Probe::NeedsBytes(_) | Probe::Unindexed => break None,
+        }
+    };
+
+    match &index {
+        Some(index) => {
+            appsrc.set_format(gst::Format::Time);
+            appsrc.set_duration(gst::ClockTime::from_nseconds(index.duration.as_nanos() as u64));
+            // With a source that works in time, qtdemux passes the media's own timestamps on
+            // instead of applying the track's edit list, which would leave this stream late by
+            // what the edit list skips (a frame, for H.264). Shifting the source's output
+            // makes up for it.
+            if let Some(pad) = appsrc.static_pad("src") {
+                pad.set_offset(-(index.presentation_offset.as_nanos() as i64));
+            }
+        }
+        None => {
+            appsrc.set_format(gst::Format::Bytes);
+            appsrc.set_size(fetcher.size.map_or(-1, |size| size as i64));
+        }
+    }
+
+    let state = Arc::new(Mutex::new(RangeState { position: 0, epoch: 0, eos: false, started: false }));
+    let feeder = Feeder { fetcher, prefix, state: state.clone() };
     appsrc.set_callbacks(
         gst_app::AppSrcCallbacks::builder()
-            .need_data({
-                let state = state.clone();
-                move |appsrc, _| {
-                    if let Err(err) = fetcher.feed(appsrc, &state) {
-                        eprintln!("moth: stream fetch failed: {err:#}");
-                        let message = gst::message::Error::builder(gst::ResourceError::Read, &format!("{err:#}"))
-                            .src(appsrc)
-                            .build();
-                        appsrc.post_message(message).ok();
-                    }
+            .need_data(move |appsrc, _| {
+                if let Err(err) = feeder.feed(appsrc) {
+                    post_error(appsrc, &err);
                 }
             })
             .seek_data(move |_, offset| {
                 let mut state = lock(&state);
-                state.position = offset;
+                state.position = match &index {
+                    // `offset` is a time in nanoseconds.
+                    Some(index) if state.started => index.fragment_offset(Duration::from_nanos(offset)),
+                    Some(_) => 0,
+                    None => offset,
+                };
                 state.epoch += 1;
                 state.eos = false;
                 true
             })
             .build(),
     );
-    appsrc.upcast()
+
+    // The player starts it (`start`), on the thread that changes the pipeline's state. Started
+    // from this thread, it could get ahead of the elements it feeds while the pipeline is still
+    // starting those, or be left running by a pipeline that has just shut down.
+    let ready = gst::message::Application::builder(gst::Structure::new_empty(READY_MESSAGE)).src(appsrc).build();
+    appsrc.post_message(ready).context("failed to announce the stream source")
+}
+
+/// The source that `message` says is ready to [`start`], if that's what the message is.
+pub fn ready_source(message: &gst::Message) -> Option<gst::Element> {
+    let gst::MessageView::Application(application) = message.view() else { return None };
+    let is_ready = application.structure().is_some_and(|structure| structure.name() == READY_MESSAGE);
+    message.src().filter(|_| is_ready)?.clone().downcast().ok()
+}
+
+/// Start a source that has announced it's ready. Call from the thread that changes the
+/// pipeline's state.
+pub fn start(source: &gst::Element) -> Result<()> {
+    source.set_locked_state(false);
+    source.sync_state_with_parent().context("failed to start a stream source")
 }
 
 struct Fetcher {
@@ -121,65 +233,28 @@ struct Fetcher {
 }
 
 impl Fetcher {
-    /// Fetch and push the next chunk. Runs on appsrc's streaming thread, so blocking is fine.
-    fn feed(&self, appsrc: &gst_app::AppSrc, state: &Mutex<RangeState>) -> Result<()> {
-        let (start, epoch) = {
-            let state = lock(state);
-            if state.eos {
-                return Ok(());
-            }
-            (state.position, state.epoch)
-        };
-        if self.size.is_some_and(|size| start >= size) {
-            mark_eos(state, epoch, appsrc);
-            return Ok(());
-        }
-        let mut end = start + self.chunk - 1;
-        if let Some(size) = self.size {
-            end = end.min(size - 1);
-        }
+    fn closed(&self) -> bool {
+        lock(&self.endpoint).closed
+    }
 
+    /// Fetch bytes `start..=end` (fewer at the end of the file), switching to the alternate URL
+    /// if the server refuses. Blocking. Gives up between attempts once `abandoned` says so.
+    fn fetch(&self, start: u64, end: u64, abandoned: impl Fn() -> bool) -> Result<Range> {
         let waiting_since = Instant::now();
-        let bytes = loop {
+        loop {
             let location = lock(&self.endpoint).location.clone();
             let requested_at = Instant::now();
             let fetched = self.http.runtime.block_on(fetch_range(&self.http.client, &location, start, end))?;
             self.record(&fetched, requested_at.elapsed());
             match fetched {
-                Fetched::Data(bytes) => break bytes,
-                Fetched::PastEnd => {
-                    mark_eos(state, epoch, appsrc);
-                    return Ok(());
-                }
+                Fetched::Data(bytes) => return Ok(Range::Data(bytes)),
+                Fetched::PastEnd => return Ok(Range::PastEnd),
                 Fetched::Forbidden => self.switch_or_wait(waiting_since, start, end)?,
             }
-            if lock(state).epoch != epoch {
-                return Ok(());
+            if abandoned() {
+                return Ok(Range::Abandoned);
             }
-        };
-
-        let length = bytes.len() as u64;
-        {
-            let mut state = lock(state);
-            if state.epoch != epoch {
-                return Ok(());
-            }
-            state.position = start + length;
-            state.eos = length < end - start + 1;
         }
-        let mut buffer = gst::Buffer::from_slice(bytes);
-        if let Some(buffer) = buffer.get_mut() {
-            buffer.set_offset(start);
-            buffer.set_offset_end(start + length);
-        }
-        // Pushing fails only when flushing or shutting down; the next need-data carries on.
-        if appsrc.push_buffer(buffer).is_ok() && {
-            let state = lock(state);
-            state.eos && state.epoch == epoch
-        } {
-            appsrc.end_of_stream().ok();
-        }
-        Ok(())
     }
 
     fn record(&self, fetched: &Fetched, elapsed: Duration) {
@@ -217,6 +292,80 @@ impl Fetcher {
             Alternate::Pending | Alternate::Unavailable => {
                 bail!("the server refused bytes {start}-{end} of {} (HTTP 403)", describe(&endpoint.location.url))
             }
+        }
+        Ok(())
+    }
+}
+
+/// Feeds the started `appsrc`. Runs on its streaming thread, so blocking is fine.
+struct Feeder {
+    fetcher: Fetcher,
+    /// The beginning of the file, which `open` fetched: served from here rather than fetched
+    /// again.
+    prefix: Vec<u8>,
+    state: Arc<Mutex<RangeState>>,
+}
+
+impl Feeder {
+    /// Fetch and push the next chunk.
+    fn feed(&self, appsrc: &gst_app::AppSrc) -> Result<()> {
+        let state = &*self.state;
+        let (start, epoch) = {
+            let state = lock(state);
+            if state.eos {
+                return Ok(());
+            }
+            (state.position, state.epoch)
+        };
+        let size = self.fetcher.size;
+        if size.is_some_and(|size| start >= size) {
+            mark_eos(state, epoch, appsrc);
+            return Ok(());
+        }
+        let mut end = start + self.fetcher.chunk - 1;
+        if let Some(size) = size {
+            end = end.min(size - 1);
+        }
+
+        let cached =
+            usize::try_from(start).ok().and_then(|start| self.prefix.get(start..)).filter(|rest| !rest.is_empty());
+        let bytes = match cached {
+            Some(rest) => {
+                // Only as far as the prefix goes; the next chunk carries on from there.
+                end = end.min(self.prefix.len() as u64 - 1);
+                rest[..(end - start + 1) as usize].to_vec()
+            }
+            None => match self.fetcher.fetch(start, end, || lock(state).epoch != epoch || self.fetcher.closed())? {
+                Range::Data(bytes) => bytes,
+                Range::PastEnd => {
+                    mark_eos(state, epoch, appsrc);
+                    return Ok(());
+                }
+                Range::Abandoned => return Ok(()),
+            },
+        };
+
+        let length = bytes.len() as u64;
+        {
+            let mut state = lock(state);
+            if state.epoch != epoch {
+                return Ok(());
+            }
+            state.position = start + length;
+            state.eos = length < end - start + 1;
+            state.started = true;
+        }
+        let mut buffer = gst::Buffer::from_slice(bytes);
+        if let Some(buffer) = buffer.get_mut() {
+            buffer.set_offset(start);
+            buffer.set_offset_end(start + length);
+        }
+        // Pushing fails only when flushing or shutting down; the next need-data carries on.
+        if appsrc.push_buffer(buffer).is_ok() && {
+            let state = lock(state);
+            state.eos && state.epoch == epoch
+        } {
+            appsrc.end_of_stream().ok();
         }
         Ok(())
     }

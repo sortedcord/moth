@@ -536,7 +536,7 @@ impl PlaybackSession {
         self.status = match event {
             PlayerEvent::Error(err) => Status::Error(err),
             PlayerEvent::Eos => Status::Ended,
-            PlayerEvent::AsyncDone => return,
+            PlayerEvent::AsyncDone | PlayerEvent::SourceReady(_) => return,
             _ if self.status == Status::Ended => return,
             PlayerEvent::Playing if !paused => Status::Playing,
             PlayerEvent::Paused if paused => Status::Paused,

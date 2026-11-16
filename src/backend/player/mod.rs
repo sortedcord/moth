@@ -8,6 +8,7 @@
 //! ```
 
 mod http_source;
+mod mp4_index;
 pub mod stats;
 mod wayland;
 
@@ -92,9 +93,15 @@ pub enum PlayerEvent {
     Eos,
     /// The pipeline finished an asynchronous state change or seek.
     AsyncDone,
+    /// A stream's source has seen the beginning of its stream, and the player can start it.
+    SourceReady(Source),
     Playing,
     Paused,
 }
+
+/// One of the player's stream sources.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Source(gst::Element);
 
 /// The decoded video's format, once caps are negotiated.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -168,12 +175,24 @@ impl Player {
         let audio_endpoint = Endpoint::new(input.audio.location.clone(), input.alternates_pending);
 
         let pipeline = gst::Pipeline::new();
-        let vsrc = http_source::element(http.clone(), video_endpoint.clone(), input.video.size, input.video.bitrate);
+        let vsrc = http_source::add_to(
+            &pipeline,
+            http.clone(),
+            video_endpoint.clone(),
+            input.video.size,
+            input.video.bitrate,
+        )?;
         let vdecode = make("decodebin3")?;
         let vqueue = make("queue")?;
         let vsink = make("waylandsink")?;
 
-        let asrc = http_source::element(http.clone(), audio_endpoint.clone(), input.audio.size, input.audio.bitrate);
+        let asrc = http_source::add_to(
+            &pipeline,
+            http.clone(),
+            audio_endpoint.clone(),
+            input.audio.size,
+            input.audio.bitrate,
+        )?;
         let adecode = make("decodebin3")?;
         let aqueue = make("queue")?;
         let aconvert = make("audioconvert")?;
@@ -193,11 +212,9 @@ impl Player {
         let asink = make("pulsesink")?;
 
         pipeline.add_many([
-            &vsrc,
             &vdecode,
             &vqueue,
             &vsink,
-            &asrc,
             &adecode,
             &aqueue,
             &aconvert,
@@ -260,6 +277,11 @@ impl Player {
                 }
                 if self.paused {
                     self.pipeline.set_state(gst::State::Paused).ok();
+                }
+            }
+            PlayerEvent::SourceReady(source) => {
+                if let Err(err) = http_source::start(&source.0) {
+                    eprintln!("moth: {err:#}");
                 }
             }
             PlayerEvent::AsyncDone if self.unmute_on_async_done => {
@@ -412,6 +434,10 @@ impl Player {
 
 impl Drop for Player {
     fn drop(&mut self) {
+        // Whatever the sources' threads are still waiting for, they needn't any more.
+        for endpoint in [&self.video_endpoint, &self.audio_endpoint] {
+            lock(endpoint).closed = true;
+        }
         self.pipeline.set_state(gst::State::Null).ok();
     }
 }
@@ -429,6 +455,9 @@ fn events(pipeline: &gst::Pipeline) -> Result<impl Stream<Item = PlayerEvent> + 
             }
             gst::MessageView::Eos(_) => Some(PlayerEvent::Eos),
             gst::MessageView::AsyncDone(_) if from_pipeline => Some(PlayerEvent::AsyncDone),
+            gst::MessageView::Application(_) => {
+                http_source::ready_source(&message).map(|source| PlayerEvent::SourceReady(Source(source)))
+            }
             gst::MessageView::StateChanged(change) if from_pipeline => match change.current() {
                 gst::State::Playing => Some(PlayerEvent::Playing),
                 gst::State::Paused => Some(PlayerEvent::Paused),
