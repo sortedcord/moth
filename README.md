@@ -138,9 +138,10 @@ Metadata has the title, channel (`xesam:artist`), thumbnail, URL and length, plu
 
 **Playback.** A GStreamer pipeline: ranged `appsrc` → `decodebin3` → `waylandsink` for video and → `scaletempo`
 → `pulsesink` for audio. `waylandsink` shares gpui's Wayland connection and attaches a `wl_subsurface` to the
-window, positioned wherever the UI lays out the player. The pipeline runs on the system clock (PipeWire's clock
-keeps running while paused, which made resuming skip ahead), with `pulsesink` (served by pipewire-pulse) following
-it: `pipewiresink`'s clock following crackled, and without it A/V drift went uncorrected.
+window, positioned wherever the UI lays out the player. The audio sink is the pipeline's clock and video follows
+it, so audio is never edited to match another clock (that's what caused pops and crackling). It's `pulsesink`
+(served by pipewire-pulse) because `pipewiresink`'s clock jumps when an idle device wakes up, which made resuming
+after a pause skip ahead.
 
 **UI.** [gpui](https://gpui.rs), Zed's GPU-accelerated UI framework, rendering through wgpu on Vulkan. It's
 vendored at a pinned revision with a small local patch (`patches/`).

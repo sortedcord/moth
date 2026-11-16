@@ -182,17 +182,15 @@ impl Player {
         let tempo = make("scaletempo")?;
         let aconvert_out = make("audioconvert")?;
         let aresample = make("audioresample")?;
-        // pulsesink (PipeWire serves it through pipewire-pulse), not pipewiresink:
-        // - pipewiresink's clock keeps running while the stream is paused and jumps when the idle
-        //   device wakes up, so resuming skipped ahead by up to the pause length. The pipeline
-        //   therefore runs on the monotonic system clock, and the sink has to follow that clock.
-        // - pipewiresink's way of following another clock (slave-method=resample) drops ~16 ms of
-        //   audio every second or two: audible crackling. Without it nothing corrects the drift
-        //   between the system and audio-device clocks (tens of ppm; more on Bluetooth/USB).
-        // pulsesink is a GstAudioBaseSink, whose default slaving ("skew") keeps it within
-        // drift-tolerance (40 ms) of the pipeline clock without touching the audio otherwise.
+        // The audio sink is the pipeline's clock, as in playbin: the audio device plays at its own
+        // rate, and video follows. Making the sink follow another clock instead means correcting
+        // the difference by editing the audio: GstAudioBaseSink's "skew" slaving jumps the
+        // playback pointer (a pop each time, several during start-up), and pipewiresink's
+        // "resample" dropped ~16 ms every second or two.
+        // pulsesink (served by pipewire-pulse) rather than pipewiresink, because pipewiresink's clock
+        // jumps when the idle device wakes up, so resuming after a pause skipped ahead by up to the
+        // pause length. pulsesink's clock stops while paused.
         let asink = make("pulsesink")?;
-        pipeline.use_clock(Some(&gst::SystemClock::obtain()));
 
         pipeline.add_many([
             &vsrc,
