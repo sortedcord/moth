@@ -17,12 +17,14 @@ a browser extension that sends YouTube links to it.
   go to the compositor through a Wayland subsurface, and moth never touches video pixels.
 - **Quality and playback controls.** Resolution and codec selection (automatic or manual), audio tracks
   (dubs), playback speed from 0.25× to 2×, fullscreen.
-- **Paste anything.** Watch, `youtu.be` and Shorts links or bare video IDs in the address bar; video details,
-  description and related videos on the watch page.
+- **Paste anything.** Watch, `youtu.be` and Shorts links or bare video IDs in the address bar (links with a
+  timestamp start there); video details, description and related videos on the watch page.
 - **Desktop integration.** An MPRIS player for media keys, shells and `playerctl`; `moth status [--watch]`
   for status bars; single-instance handoff, so `moth <url>` opens the link in the running window.
 - **Browser handoff.** A Chromium extension that opens YouTube links in moth instead of the browser.
 - **Fluid UI.** Layout changes animate on springs instead of jumping, rendered with Vulkan.
+- **Your defaults.** Preferred resolution and codecs, default speed, seek steps, animations and more are
+  settings, not hardcoded choices.
 
 ## Performance
 
@@ -62,13 +64,13 @@ Paste a YouTube link (watch, `youtu.be`, Shorts, … or a bare video ID) into th
 | `Ctrl+L` | Focus the address bar |
 | `Ctrl+,` | Settings |
 | `space` / `k` | Play / pause |
-| `j` / `l` | Back / forward 10 s |
-| `←` / `→` | Back / forward 5 s |
+| `j` / `l` | Back / forward 10 s (adjustable in settings) |
+| `←` / `→` | Back / forward 5 s (adjustable in settings) |
 | `f`, or double-click the video | Fullscreen |
 | `Esc` | Leave fullscreen |
 
 Watch-page keys apply when the address bar isn't focused. The gear button under the video has quality, codec,
-audio track and speed.
+audio track and speed. Settings are saved to `~/.config/moth/settings.json`.
 
 ### Open YouTube links in moth (browser extension)
 
@@ -103,7 +105,7 @@ bars. Without a running moth it prints `{"running":false,…}`; `--watch` then w
 
 ```json
 {"running":true,"page":"watch","status":"playing","error":null,
- "video":{"id":"aqz-KE-bpKQ","url":"https://www.youtube.com/watch?v=aqz-KE-bpKQ",
+ "video":{"source":"youtube","id":"aqz-KE-bpKQ","url":"https://www.youtube.com/watch?v=aqz-KE-bpKQ",
           "title":"Big Buck Bunny 60fps 4K - Official Blender Foundation Short Film","channel":"Blender",
           "thumbnail":"https://i.ytimg.com/vi/aqz-KE-bpKQ/hqdefault.jpg"},
  "position":12.78,"duration":634.0,"rate":1.0,
@@ -137,25 +139,25 @@ Metadata has the title, channel (`xesam:artist`), thumbnail, URL and length, plu
 **Playback.** A GStreamer pipeline: ranged `appsrc` → `decodebin3` → `waylandsink` for video and → `scaletempo`
 → `pipewiresink` for audio. `waylandsink` shares gpui's Wayland connection and attaches a `wl_subsurface` to the
 window, positioned wherever the UI lays out the player. The pipeline runs on the system clock (PipeWire's clock
-keeps running while paused, which made resuming skip ahead).
+keeps running while paused, which made resuming skip ahead), and never seeks before it first reaches PLAYING
+(pipewiresink can deadlock otherwise, [pipewire#5171](https://gitlab.freedesktop.org/pipewire/pipewire/-/work_items/5171)).
 
 **UI.** [gpui](https://gpui.rs), Zed's GPU-accelerated UI framework, rendering through wgpu on Vulkan. It's
 vendored at a pinned revision with a small local patch (`patches/`).
 
 ## Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, debug tools and conventions. Source layout:
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the architecture, debug tools and conventions. Source layout:
 
-- `src/main.rs`: gpui views (home grid, watch page, settings) and the video canvas that positions the subsurface
-- `src/youtube.rs`: RustyPipe client (video details, related videos, stream selection, URL resolving)
-- `src/player.rs`: GStreamer pipeline, ranged HTTP source and the yt-dlp resolver
-- `src/layout.rs`: spring-animated home grid layout
-- `src/ipc.rs`: the socket (single-instance handoff, `moth status [--watch]`), the shared now-playing state,
-  and the browser extension's native-messaging host
-- `src/mpris.rs`: the MPRIS service
-- `src/text_input.rs`: the address bar
-- `src/settings.rs`: persisted settings
-- `src/data.rs`: sample videos for the home page
+- `src/backend/`: everything that isn't UI, and nothing that depends on gpui
+  - `source.rs`: the `VideoSource` trait a site implements; `youtube/` is the only one so far (RustyPipe, with
+    yt-dlp as fallback and for seekable alternate URLs)
+  - `media.rs`, `selection.rs`: the site-neutral model (videos, streams, codecs) and stream selection
+  - `player/`: the GStreamer pipeline, the ranged HTTP source and the Wayland embedding
+- `src/ui/`: the gpui frontend: `mod.rs` (window, navigation, top bar), `playback.rs` (the playback session),
+  `watch/`, `home.rs` + `layout.rs` (spring-animated grid), `settings_page.rs`, `actions.rs` (keyboard shortcuts)
+- `src/desktop/`: the instance socket and `moth status`, MPRIS, and the browser extension's native host
+- `src/settings.rs`: persisted settings; `src/dev.rs`: `MOTH_*` developer options
 - `extension/`: the "Open in moth" browser extension and its native-host installer
 - `patches/`: local patches to vendored gpui (currently: Vulkan-only wgpu backend)
 
@@ -163,7 +165,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, debug tools and conventions. S
 
 moth is built on the work of many projects:
 
-- [gpui](https://gpui.rs) from [Zed](https://zed.dev) (Apache-2.0): the UI framework. `src/text_input.rs` is
+- [gpui](https://gpui.rs) from [Zed](https://zed.dev) (Apache-2.0): the UI framework. `src/ui/text_input.rs` is
   adapted from gpui's text input example.
 - [RustyPipe](https://codeberg.org/ThetaDev/rustypipe) by ThetaDev (GPL-3.0): YouTube's internal API.
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) (Unlicense), with [Deno](https://deno.com) (MIT): fallback and
