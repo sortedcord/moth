@@ -134,7 +134,8 @@ Metadata has the title, channel (`xesam:artist`), thumbnail, URL and length, plu
 - RustyPipe currently gets streams from YouTube's iOS client, whose URLs only serve a little ahead of real-time
   playback. So [yt-dlp](https://github.com/yt-dlp/yt-dlp) resolves web-client URLs for the *same* files in the
   background, and the player switches to them when a seek needs it. yt-dlp is also the full fallback if
-  RustyPipe fails.
+  RustyPipe fails. YouTube sometimes holds yt-dlp's URLs back for a few seconds (the slot of an ad before the
+  video); moth waits that out, so a far seek right after opening a video can take a moment.
 
 **Playback.** A GStreamer pipeline: ranged `appsrc` → `decodebin3` → `waylandsink` for video and → `scaletempo`
 → `pulsesink` for audio. `waylandsink` shares gpui's Wayland connection and attaches a `wl_subsurface` to the

@@ -4,6 +4,9 @@
 //! ahead of real-time playback. Web-client URLs for the same files don't have that limit, so the
 //! catalog offers them as alternate URLs (resolved by yt-dlp), which the player switches to when
 //! a long seek gets refused.
+//!
+//! yt-dlp's URLs have a catch of their own: YouTube may only start serving them a few seconds
+//! after handing them out. They leave this module once they work (see [`resolve_with_ytdlp`]).
 
 mod ytdlp;
 
@@ -132,7 +135,7 @@ impl VideoSource for YouTube {
             };
             eprintln!("moth: RustyPipe stream resolution failed, trying yt-dlp: {rustypipe_error:#}");
             let format = ytdlp_format.unwrap_or_else(|| ytdlp::format_for(&preferences));
-            match tokio::task::spawn_blocking(move || ytdlp::resolve(&id, &format)).await? {
+            match resolve_with_ytdlp(id, format).await {
                 Ok(mut catalog) => {
                     catalog.resolver_detail = "yt-dlp (RustyPipe failed)".to_string();
                     Ok(catalog)
@@ -145,7 +148,7 @@ impl VideoSource for YouTube {
     fn alternate_urls(&self, id: String, video: &VideoStream, audio: &AudioStream) -> Option<BoxFuture<AlternateUrls>> {
         let format = format!("{}+{}", video.id.0, audio.id.0);
         Some(Box::pin(async move {
-            let catalog = tokio::task::spawn_blocking(move || ytdlp::resolve(&id, &format)).await??;
+            let catalog = resolve_with_ytdlp(id, format).await?;
             match (catalog.video.into_iter().next(), catalog.audio.into_iter().next()) {
                 (Some(video), Some(audio)) => Ok(AlternateUrls { video: video.location, audio: audio.location }),
                 _ => bail!("yt-dlp returned no alternate URLs"),
@@ -160,6 +163,17 @@ impl VideoSource for YouTube {
     fn thumbnail_url(&self, id: &str) -> Option<String> {
         Some(format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"))
     }
+}
+
+/// Have yt-dlp resolve `format` of a video, and return its catalog once the URLs in it work.
+async fn resolve_with_ytdlp(id: String, format: String) -> Result<StreamCatalog> {
+    let resolved = tokio::task::spawn_blocking(move || ytdlp::resolve(&id, &format)).await??;
+    let wait = resolved.usable_in();
+    if !wait.is_zero() {
+        eprintln!("moth: YouTube serves yt-dlp's URLs in {:.1}s; holding them until then", wait.as_secs_f64());
+        tokio::time::sleep(wait).await;
+    }
+    Ok(resolved.catalog)
 }
 
 fn catalog(player: &VideoPlayer) -> StreamCatalog {

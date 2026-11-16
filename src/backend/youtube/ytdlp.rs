@@ -1,12 +1,12 @@
 //! yt-dlp as a stream resolver: the fallback when RustyPipe fails, and the source of web-client
 //! URLs for seeking (see [`super::YouTube::alternate_urls`]).
 
+use std::collections::BTreeMap;
 use std::process::Command;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use serde::Deserialize;
-
-use std::collections::BTreeMap;
 
 use crate::backend::media::{AudioCodec, AudioStream, Location, StreamCatalog, StreamId, VideoCodec, VideoStream};
 use crate::backend::selection::StreamPreferences;
@@ -60,6 +60,8 @@ struct Format {
     /// Headers the URL must be fetched with (some clients' URLs are refused without them).
     #[serde(default)]
     http_headers: BTreeMap<String, String>,
+    /// Unix time from which YouTube serves the URL (see [`Resolved::usable_in`]).
+    available_at: Option<f64>,
 }
 
 impl Format {
@@ -71,8 +73,35 @@ impl Format {
     }
 }
 
+/// The longest moth waits for URLs to become usable: longer than the ads YouTube schedules, short
+/// enough not to look hung if the time yt-dlp reports is ever nonsense.
+const MAX_WAIT: Duration = Duration::from_secs(60);
+
+/// What yt-dlp resolved.
+pub struct Resolved {
+    pub catalog: StreamCatalog,
+    available_at: Option<SystemTime>,
+}
+
+impl Resolved {
+    /// How long until YouTube serves the catalog's URLs.
+    ///
+    /// When YouTube schedules an ad before the video, its servers refuse the streams (HTTP 403)
+    /// until the ad, or the part of it that can't be skipped, would have played: a few seconds,
+    /// or none at all, which made far seeks fail every now and then. yt-dlp reports that time as
+    /// `available_at` and sits it out before a download, but asked for JSON it only prints it.
+    pub fn usable_in(&self) -> Duration {
+        self.usable_from(SystemTime::now())
+    }
+
+    fn usable_from(&self, now: SystemTime) -> Duration {
+        let wait = self.available_at.and_then(|available_at| available_at.duration_since(now).ok());
+        wait.unwrap_or_default().min(MAX_WAIT)
+    }
+}
+
 /// Resolve one video+audio pair. Blocking; run it on a blocking thread.
-pub fn resolve(video_id: &str, format: &str) -> Result<StreamCatalog> {
+pub fn resolve(video_id: &str, format: &str) -> Result<Resolved> {
     // yt-dlp may run alongside playback (for alternate URLs), so keep it out of the way.
     let output = Command::new("nice")
         .args(["-n", "10", "yt-dlp", "--no-warnings", "-f", format, "-j", "--", video_id])
@@ -81,10 +110,21 @@ pub fn resolve(video_id: &str, format: &str) -> Result<StreamCatalog> {
     if !output.status.success() {
         bail!("yt-dlp: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
-    let info: Info = serde_json::from_slice(&output.stdout).context("unexpected yt-dlp output")?;
+    parse(&output.stdout)
+}
+
+/// Read what `yt-dlp -j` printed.
+fn parse(json: &[u8]) -> Result<Resolved> {
+    let info: Info = serde_json::from_slice(json).context("unexpected yt-dlp output")?;
     let formats = info
         .requested_formats
         .ok_or_else(|| anyhow!("yt-dlp picked a combined stream; moth needs separate video and audio"))?;
+    let available_at = formats
+        .iter()
+        .filter_map(|format| format.available_at)
+        .reduce(f64::max)
+        .and_then(|at| Duration::try_from_secs_f64(at).ok())
+        .map(|at| SystemTime::UNIX_EPOCH + at);
     let mut video = Vec::new();
     let mut audio = Vec::new();
     for format in formats {
@@ -98,7 +138,14 @@ pub fn resolve(video_id: &str, format: &str) -> Result<StreamCatalog> {
     if video.is_empty() || audio.is_empty() {
         bail!("yt-dlp didn't return both a video and an audio stream");
     }
-    Ok(StreamCatalog { video, audio, resolver: "yt-dlp", resolver_detail: "yt-dlp".to_string(), has_alternates: false })
+    let catalog = StreamCatalog {
+        video,
+        audio,
+        resolver: "yt-dlp",
+        resolver_detail: "yt-dlp".to_string(),
+        has_alternates: false,
+    };
+    Ok(Resolved { catalog, available_at })
 }
 
 fn stream_id(format_id: &str) -> StreamId {
@@ -159,5 +206,42 @@ mod tests {
         assert!(format.starts_with("(bv[height<=720][vcodec^=vp9][protocol=https]/"));
         assert!(format.ends_with(")+(ba[acodec^=opus][protocol=https]/ba[protocol=https])"));
         assert_eq!(stream_id("251-drc"), StreamId(251));
+    }
+
+    /// The fields moth reads from `yt-dlp -j`, for one video and one audio format.
+    fn output(video_extra: &str, audio_extra: &str) -> String {
+        format!(
+            r#"{{"id": "eRsGyueVLvQ", "epoch": 1794821410, "requested_formats": [
+                {{"format_id": "247", "url": "https://rr4.example/videoplayback?itag=247", "vcodec": "vp9",
+                  "acodec": "none", "width": 1280, "height": 546, "fps": 24, "tbr": 587.312,
+                  "filesize": 65194674, "format_note": "720p", "http_headers": {{"User-Agent": "Mozilla/5.0"}}
+                  {video_extra}}},
+                {{"format_id": "251", "url": "https://rr4.example/videoplayback?itag=251", "vcodec": "none",
+                  "acodec": "opus", "tbr": 129.725, "filesize": 14400537, "format_note": "medium"
+                  {audio_extra}}}
+            ]}}"#
+        )
+    }
+
+    #[test]
+    fn reads_formats_and_headers() {
+        let resolved = parse(output("", "").as_bytes()).expect("parses");
+        let (video, audio) = (&resolved.catalog.video[0], &resolved.catalog.audio[0]);
+        assert_eq!((video.id, video.codec, video.size), (StreamId(247), VideoCodec::Vp9, Some(65_194_674)));
+        assert_eq!(video.location.headers, [("User-Agent".to_string(), "Mozilla/5.0".to_string())]);
+        assert_eq!((audio.id, audio.codec, audio.bitrate), (StreamId(251), AudioCodec::Opus, Some(129_725)));
+        assert_eq!(resolved.usable_in(), Duration::ZERO);
+    }
+
+    #[test]
+    fn waits_until_every_url_is_available() {
+        let at = |seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
+        let json = output(r#", "available_at": 1794821412"#, r#", "available_at": 1794821415"#);
+        let resolved = parse(json.as_bytes()).expect("parses");
+        assert_eq!(resolved.usable_from(at(1_794_821_410)), Duration::from_secs(5));
+        assert_eq!(resolved.usable_from(at(1_794_821_415)), Duration::ZERO);
+        assert_eq!(resolved.usable_from(at(1_794_821_500)), Duration::ZERO);
+        // A time that can't be right doesn't stall playback for long.
+        assert_eq!(resolved.usable_from(at(1_794_000_000)), MAX_WAIT);
     }
 }
