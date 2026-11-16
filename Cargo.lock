@@ -2993,6 +2993,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel",
+ "futures",
  "gpui",
  "gpui_linux",
  "gstreamer",

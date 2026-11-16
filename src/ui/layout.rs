@@ -9,6 +9,8 @@ use std::time::Instant;
 
 use gpui::{ScrollHandle, SpringConfig, SpringState};
 
+use super::theme::PAD;
+
 /// Slightly under-damped (ζ ≈ 0.9): settles in about a third of a second with no visible overshoot.
 const SPRING: SpringConfig = SpringConfig::new(320.0, 32.0, 1.0);
 /// Settled once within a quarter pixel (and the matching velocity).
@@ -25,7 +27,6 @@ pub const SIDEBAR_W: f32 = 220.0;
 pub const RAIL_W: f32 = 76.0;
 /// Below this window width the sidebar collapses to the rail.
 pub const COLLAPSE_W: f32 = 1000.0;
-pub const PAD: f32 = 16.0;
 /// Room kept free on the right for the scrollbar.
 const SCROLLBAR_W: f32 = 8.0;
 
@@ -154,15 +155,16 @@ impl HomeLayout {
         }
     }
 
-    /// Steps every spring toward the layout for this frame. Returns whether another frame is needed.
-    pub fn step(&mut self, viewport_w: f32, reduce_motion: bool) -> bool {
-        self.step_at(Instant::now(), viewport_w, reduce_motion)
+    /// Steps every spring toward the layout for this frame (or jumps there, without `animate`).
+    /// Returns whether another frame is needed.
+    pub fn step(&mut self, viewport_w: f32, animate: bool) -> bool {
+        self.step_at(Instant::now(), viewport_w, animate)
     }
 
-    fn step_at(&mut self, now: Instant, viewport_w: f32, reduce_motion: bool) -> bool {
+    fn step_at(&mut self, now: Instant, viewport_w: f32, animate: bool) -> bool {
         let dt = self.last_tick.map_or(FIRST_DT, |last| (now - last).as_secs_f32().clamp(MIN_DT, MAX_DT));
         let dt = if self.slow_motion { dt * SLOW_MOTION } else { dt };
-        let snap = !self.initialized || reduce_motion;
+        let snap = !self.initialized || !animate;
         self.initialized = true;
         let mut moving = 0;
 
@@ -249,9 +251,9 @@ mod tests {
     fn layout_snaps_on_first_frame_then_animates() {
         let mut layout = HomeLayout::new(20);
         let mut now = Instant::now();
-        assert!(!layout.step_at(now, 1440.0, false));
+        assert!(!layout.step_at(now, 1440.0, true));
         let mut frames = 0;
-        while layout.step_at(now, 900.0, false) {
+        while layout.step_at(now, 900.0, true) {
             now += std::time::Duration::from_millis(16);
             frames += 1;
             assert!(frames < 120, "layout didn't settle within two seconds");

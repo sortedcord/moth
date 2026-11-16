@@ -1,0 +1,240 @@
+//! Source-neutral description of videos and their streams. Sources ([`super::source`]) produce
+//! these; the UI, the player and IPC only ever see these types.
+//!
+//! Values are raw (counts, durations, dates), not display strings: formatting is the UI's job.
+
+use std::fmt;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+
+/// A video in a particular source, e.g. `youtube` / `aqz-KE-bpKQ`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct VideoRef {
+    /// [`super::source::VideoSource::id`] of the source that knows this video.
+    pub source: &'static str,
+    pub id: String,
+}
+
+impl fmt::Display for VideoRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.source, self.id)
+    }
+}
+
+/// What a pasted link points at.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Link {
+    pub video: VideoRef,
+    /// Where to start (e.g. YouTube's `t=` parameter).
+    pub start: Option<Duration>,
+}
+
+/// Everything on a video's watch page.
+#[derive(Clone, Debug)]
+pub struct VideoDetails {
+    pub title: String,
+    pub channel: Channel,
+    pub views: Option<u64>,
+    pub likes: Option<u64>,
+    pub published: Option<Published>,
+    pub description: String,
+    pub related: Vec<VideoSummary>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Channel {
+    pub name: String,
+    pub avatar_url: Option<String>,
+    pub subscribers: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Published {
+    Date {
+        year: i32,
+        month: u8,
+        day: u8,
+    },
+    /// As the source words it, when it has no date ("3 years ago", "Premiered …").
+    Text(String),
+}
+
+/// A video in a list (related videos, the home feed).
+#[derive(Clone, Debug)]
+pub struct VideoSummary {
+    pub video: VideoRef,
+    pub title: String,
+    pub channel: Option<String>,
+    pub views: Option<u64>,
+    /// Relative age as the source words it, e.g. "3 years ago".
+    pub age: Option<String>,
+    pub duration: Option<Duration>,
+    pub thumbnail_url: Option<String>,
+    /// Short-form vertical video (YouTube Shorts and the like).
+    pub is_short: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VideoCodec {
+    #[serde(rename = "vp9")]
+    Vp9,
+    #[serde(rename = "av1")]
+    Av1,
+    #[serde(rename = "h264")]
+    H264,
+}
+
+impl VideoCodec {
+    pub const ALL: [Self; 3] = [Self::Vp9, Self::Av1, Self::H264];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Vp9 => "VP9",
+            Self::Av1 => "AV1",
+            Self::H264 => "H.264",
+        }
+    }
+}
+
+impl fmt::Display for VideoCodec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AudioCodec {
+    #[serde(rename = "opus")]
+    Opus,
+    #[serde(rename = "aac")]
+    Aac,
+}
+
+impl AudioCodec {
+    pub const ALL: [Self; 2] = [Self::Opus, Self::Aac];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Opus => "Opus",
+            Self::Aac => "AAC",
+        }
+    }
+}
+
+impl fmt::Display for AudioCodec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Where to fetch a stream: the URL plus any HTTP headers the server insists on (yt-dlp's
+/// URLs from some YouTube clients are refused without the matching User-Agent).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Location {
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+}
+
+impl Location {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self { url: url.into(), headers: Vec::new() }
+    }
+}
+
+/// Identifies a stream within its catalog. What the number means is up to the source (YouTube
+/// uses format itags), so only compare ids from the same catalog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StreamId(pub u64);
+
+#[derive(Clone, Debug)]
+pub struct VideoStream {
+    pub id: StreamId,
+    pub location: Location,
+    /// The source's own quality label, e.g. "1080p60" (YouTube also says "1080p" for 2048x858).
+    pub quality: String,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u8,
+    pub codec: VideoCodec,
+    /// Average bitrate, bits per second.
+    pub bitrate: Option<u32>,
+    pub size: Option<u64>,
+}
+
+impl VideoStream {
+    /// Resolution class as the source names it ("1080" for 1920x1080, 2048x858 and 1080x1920).
+    pub fn resolution(&self) -> u32 {
+        let digits: String = self.quality.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().unwrap_or_else(|_| self.width.min(self.height))
+    }
+
+    /// e.g. "1080p60", "720p".
+    pub fn label(&self) -> String {
+        quality_label(self.resolution(), self.fps)
+    }
+}
+
+/// e.g. "1080p60" (frame rates above 30 are spelled out), "720p".
+pub fn quality_label(resolution: u32, fps: u8) -> String {
+    if fps > 30 { format!("{resolution}p{fps}") } else { format!("{resolution}p") }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AudioTrack {
+    pub id: String,
+    /// Language name, e.g. "English (original)".
+    pub name: String,
+    pub is_default: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct AudioStream {
+    pub id: StreamId,
+    pub location: Location,
+    pub codec: AudioCodec,
+    /// Average bitrate, bits per second.
+    pub bitrate: Option<u32>,
+    pub size: Option<u64>,
+    /// For videos with several audio tracks (dubs).
+    pub track: Option<AudioTrack>,
+}
+
+impl AudioStream {
+    /// e.g. "Opus · 135 kbps".
+    pub fn label(&self) -> String {
+        match self.bitrate {
+            Some(bitrate) => format!("{} · {} kbps", self.codec, (bitrate + 500) / 1000),
+            None => self.codec.to_string(),
+        }
+    }
+}
+
+/// Every playable stream of one video.
+#[derive(Clone, Debug)]
+pub struct StreamCatalog {
+    pub video: Vec<VideoStream>,
+    pub audio: Vec<AudioStream>,
+    /// What produced the catalog, e.g. `rustypipe`; stable, reported over IPC.
+    pub resolver: &'static str,
+    /// Human-readable details, e.g. "RustyPipe (ios client)".
+    pub resolver_detail: String,
+    /// The source can supply alternate URLs for these streams (see
+    /// [`super::source::VideoSource::alternate_urls`]).
+    pub has_alternates: bool,
+}
+
+/// A pair of streams to play.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub video: StreamId,
+    pub audio: StreamId,
+}
+
+/// Other URLs serving byte-identical files for a [`Selection`], used when the primary URLs stop
+/// serving (see [`crate::backend::player`]).
+#[derive(Clone, Debug)]
+pub struct AlternateUrls {
+    pub video: Location,
+    pub audio: Location,
+}

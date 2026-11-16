@@ -6,12 +6,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{ObjectPath, OwnedValue, Value};
 use zbus::{Connection, interface};
 
-use crate::ipc::{Command, Commands, Hub, NowPlaying};
+use super::status::{Hub, NowPlaying, PlaybackStatus};
+use super::{Command, Commands, Seek};
 
 const PATH: &str = "/org/mpris/MediaPlayer2";
 const NO_TRACK: &str = "/org/mpris/MediaPlayer2/TrackList/NoTrack";
@@ -82,9 +84,9 @@ fn micros(seconds: f64) -> i64 {
 
 fn playback_status(now: &NowPlaying) -> &'static str {
     match now.status {
-        "playing" | "buffering" | "resolving" => "Playing",
-        "paused" => "Paused",
-        _ => "Stopped",
+        PlaybackStatus::Playing | PlaybackStatus::Buffering | PlaybackStatus::Resolving => "Playing",
+        PlaybackStatus::Paused => "Paused",
+        PlaybackStatus::Idle | PlaybackStatus::Ended | PlaybackStatus::Error => "Stopped",
     }
 }
 
@@ -100,8 +102,8 @@ fn metadata_key(now: &NowPlaying) -> impl PartialEq {
 }
 
 /// Object paths only allow `[A-Za-z0-9_]`; video IDs also use `-`.
-fn track_id(video_id: &str) -> String {
-    let mut path = String::from("/dev/moth/video/v");
+fn track_id(source: &str, video_id: &str) -> String {
+    let mut path = format!("/dev/moth/{source}/v");
     for byte in video_id.bytes() {
         match byte {
             b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' => path.push(byte as char),
@@ -194,15 +196,16 @@ impl Player {
         self.send(Command::Play);
     }
 
+    /// Microseconds.
     fn seek(&self, offset: i64) {
-        self.send(Command::Seek(offset));
+        self.send(Command::Seek(Seek::By(offset as f64 / 1e6)));
     }
 
     fn set_position(&self, track: ObjectPath<'_>, position: i64) {
         // Ignored unless it's for the current track (per the spec).
-        let current = self.now().video.map(|video| track_id(&video.id));
-        if current.as_deref() == Some(track.as_str()) {
-            self.send(Command::SetPosition(position));
+        let current = self.now().video.map(|video| track_id(video.source, &video.id));
+        if current.as_deref() == Some(track.as_str()) && position >= 0 {
+            self.send(Command::Seek(Seek::To(Duration::from_micros(position as u64))));
         }
     }
 
@@ -246,11 +249,15 @@ impl Player {
             insert("mpris:trackid", ObjectPath::from_static_str_unchecked(NO_TRACK).into());
             return metadata;
         };
-        if let Ok(path) = ObjectPath::try_from(track_id(&video.id)) {
+        if let Ok(path) = ObjectPath::try_from(track_id(video.source, &video.id)) {
             insert("mpris:trackid", path.into());
         }
-        insert("xesam:url", video.url.into());
-        insert("mpris:artUrl", video.thumbnail.into());
+        if let Some(url) = video.url {
+            insert("xesam:url", url.into());
+        }
+        if let Some(thumbnail) = video.thumbnail {
+            insert("mpris:artUrl", thumbnail.into());
+        }
         if let Some(title) = video.title {
             insert("xesam:title", title.into());
         }
@@ -341,9 +348,9 @@ mod tests {
     #[test]
     fn track_ids_are_valid_object_paths() {
         for id in ["aqz-KE-bpKQ", "WhWc3b3KhnY", "a_b-c"] {
-            let path = track_id(id);
+            let path = track_id("youtube", id);
             assert!(ObjectPath::try_from(path.as_str()).is_ok(), "{path}");
         }
-        assert_ne!(track_id("a-b"), track_id("a_b"));
+        assert_ne!(track_id("youtube", "a-b"), track_id("youtube", "a_b"));
     }
 }
