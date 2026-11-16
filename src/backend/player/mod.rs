@@ -303,7 +303,7 @@ impl Player {
             gst::ClockTime::NONE,
         );
         if let Err(err) = result {
-            eprintln!("moth: seek failed: {err}");
+            eprintln!("moth: seek to {position:?} failed: {err}");
         }
     }
 

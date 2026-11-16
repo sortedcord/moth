@@ -32,7 +32,6 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, Raw
 use crate::backend::Backend;
 use crate::backend::media::{Link, VideoRef, VideoSummary};
 use crate::backend::player::WaylandTarget;
-use crate::backend::samples;
 use crate::desktop::status::{Hub, NowPlaying, Page, VideoInfo};
 use crate::desktop::{Command, socket};
 use crate::dev::DevOptions;
@@ -149,7 +148,7 @@ impl AppView {
         if dev.frame_stats {
             window.set_debug_frame_overlay_mode(gpui::DebugFrameOverlayMode::Full);
         }
-        let feed = samples::home_feed();
+        let feed = cx.global::<BackendHandle>().0.home_feed();
         let target = wayland_target(window);
         let session = cx.new(|cx| PlaybackSession::new(target, cx));
         let address = cx.new(|cx| {

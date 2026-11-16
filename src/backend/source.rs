@@ -7,7 +7,7 @@ use std::pin::Pin;
 
 use anyhow::Result;
 
-use super::media::{AlternateUrls, AudioStream, Link, StreamCatalog, VideoDetails, VideoStream};
+use super::media::{AlternateUrls, AudioStream, Link, StreamCatalog, VideoDetails, VideoStream, VideoSummary};
 use super::selection::StreamPreferences;
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'static>>;
@@ -50,6 +50,11 @@ pub trait VideoSource: Send + Sync {
 
     fn thumbnail_url(&self, _id: &str) -> Option<String> {
         None
+    }
+
+    /// Videos to put on the home page.
+    fn featured(&self) -> Vec<VideoSummary> {
+        Vec::new()
     }
 }
 

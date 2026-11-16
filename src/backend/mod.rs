@@ -3,6 +3,7 @@
 //! Nothing in here depends on gpui. The UI talks to sites only through [`Backend`] and the
 //! neutral types in [`media`], and to GStreamer only through [`player`].
 
+mod local;
 pub mod media;
 pub mod player;
 pub mod samples;
@@ -16,7 +17,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result, anyhow, bail};
 
 use crate::dev::DevOptions;
-use media::{AlternateUrls, Link, Selection, StreamCatalog, VideoDetails, VideoRef};
+use media::{AlternateUrls, Link, Selection, StreamCatalog, VideoDetails, VideoRef, VideoSummary};
 use selection::StreamPreferences;
 use source::VideoSource;
 
@@ -43,7 +44,15 @@ impl Backend {
             .context("failed to start tokio runtime")?;
         let http = reqwest::Client::builder().build()?;
         let youtube = runtime.block_on(youtube::YouTube::new(dev.ytdlp_format.clone()))?;
-        let sources: Vec<Arc<dyn VideoSource>> = vec![Arc::new(youtube)];
+        let mut sources: Vec<Arc<dyn VideoSource>> = vec![Arc::new(youtube)];
+        if let Some(dir) = &dev.media_dir {
+            let _runtime = runtime.enter();
+            match local::Local::new(dir) {
+                Ok(Some(local)) => sources.push(Arc::new(local)),
+                Ok(None) => {}
+                Err(err) => eprintln!("moth: local videos unavailable: {err:#}"),
+            }
+        }
         Ok(Arc::new(Self { runtime, http, sources }))
     }
 
@@ -110,6 +119,13 @@ impl Backend {
         let audio_stream = catalog.audio_stream(selection.audio)?;
         let future = source.alternate_urls(video.id.clone(), video_stream, audio_stream)?;
         Some(self.run(future))
+    }
+
+    /// The home page: each source's featured videos (local dev videos first), then the samples.
+    pub fn home_feed(&self) -> Vec<VideoSummary> {
+        let mut feed: Vec<_> = self.sources.iter().rev().flat_map(|source| source.featured()).collect();
+        feed.extend(samples::home_feed());
+        feed
     }
 
     pub fn web_url(&self, video: &VideoRef) -> Option<String> {
