@@ -29,6 +29,8 @@ pub struct PlayerStats {
     pub av_offset_ms: Option<f64>,
     pub video_net: NetStats,
     pub audio_net: NetStats,
+    /// Video is neither fetched nor decoded (see [`super::Player::set_video_suspended`]).
+    pub video_suspended: bool,
 }
 
 /// GStreamer resets these on every pause/resume.

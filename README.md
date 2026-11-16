@@ -23,6 +23,8 @@ a browser extension that sends YouTube links to it.
   for status bars; single-instance handoff, so `moth <url>` opens the link in the running window.
 - **Browser handoff.** A Chromium extension that opens YouTube links in moth instead of the browser.
 - **Fluid UI.** Layout changes animate on springs instead of jumping, rendered with Vulkan.
+- **Light on resources.** While the window is out of sight (another workspace, scrolled away, covered), moth
+  stops downloading and decoding video and only plays the audio; the picture catches up when you look again.
 - **Your defaults.** Preferred resolution and codecs, default speed, seek steps, animations and more are
   settings, not hardcoded choices.
 
@@ -111,12 +113,12 @@ bars. Without a running moth it prints `{"running":false,…}`; `--watch` then w
  "position":12.78,"duration":634.0,"rate":1.0,
  "stream":{"width":1280,"height":720,"fps":60.0,"quality":"720p60","quality_auto":true,
            "video_codec":"VP9","audio_codec":"Opus","decoder":"vavp9dec","resolver":"rustypipe",
-           "fallback_urls":false},
+           "fallback_urls":false,"video_suspended":false},
  "fullscreen":false}
 ```
 
 `status` is one of `idle`, `resolving`, `buffering`, `playing`, `paused`, `ended`, `error`; `page` is `home`, `watch`
-or `settings`. Title and channel are `null` until the watch page has loaded. Under the hood this is the
+or `settings`. `video_suspended` is true while video is off because the window is out of sight. Title and channel are `null` until the watch page has loaded. Under the hood this is the
 `$XDG_RUNTIME_DIR/moth.sock` socket: send the line `status` or `watch` (a URL line opens that video).
 
 moth is also an **MPRIS** player (`org.mpris.MediaPlayer2.moth`), so media keys, desktop shells and `playerctl`
@@ -143,6 +145,12 @@ window, positioned wherever the UI lays out the player. The audio sink is the pi
 it, so audio is never edited to match another clock (that's what caused pops and crackling). It's `pulsesink`
 (served by pipewire-pulse) because `pipewiresink`'s clock jumps when an idle device wakes up, which made resuming
 after a pause skip ahead.
+
+**Hidden windows.** niri (and some other compositors) never tell a window on another workspace that it's hidden,
+but they all stop granting it frames, so moth times how long a frame takes, as mpv does. Once the window has been
+out of sight for a moment, the video source stops fetching, so the video branch runs dry and decodes nothing,
+while audio plays on. Coming back, the source carries on from the keyframe before the current position (found
+in the stream's own index: an MP4 `sidx` or WebM cues), without a seek, so audio isn't interrupted.
 
 **UI.** [gpui](https://gpui.rs), Zed's GPU-accelerated UI framework, rendering through wgpu on Vulkan. It's
 vendored at a pinned revision with a small local patch (`patches/`).

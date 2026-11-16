@@ -77,6 +77,8 @@ pub struct StreamInfo {
     pub resolver: &'static str,
     /// Whether playback switched to alternate URLs (for seeking far ahead).
     pub fallback_urls: bool,
+    /// Video is neither fetched nor decoded, because the window is hidden. Audio plays on.
+    pub video_suspended: bool,
 }
 
 impl NowPlaying {

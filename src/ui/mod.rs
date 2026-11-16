@@ -12,6 +12,7 @@ mod icons;
 mod images;
 mod layout;
 mod playback;
+mod presence;
 mod settings_page;
 mod sidebar;
 mod text_input;
@@ -128,6 +129,11 @@ pub struct AppView {
     feed: Vec<VideoSummary>,
     focus: FocusHandle,
     hub: Arc<Hub>,
+    /// Whether gpui says the window is visible, and whether its frames are being shown (see
+    /// [`presence`]): video is suspended unless both.
+    platform_shown: bool,
+    frames_shown: bool,
+    _presence: Option<Task<()>>,
     _resolve: Option<Task<()>>,
     _page_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
@@ -166,7 +172,12 @@ impl AppView {
             }),
             cx.observe_in(&session, window, |this, _, window, cx| {
                 this.publish(window, cx);
+                this.update_presence(window, cx);
                 cx.notify();
+            }),
+            cx.observe_window_visibility(window, |this, visibility, _, cx| {
+                this.platform_shown = visibility.is_visible();
+                this.apply_shown(cx);
             }),
             // Fullscreen changes come with a resize.
             cx.observe_window_bounds(window, |this, window, cx| this.publish(window, cx)),
@@ -191,6 +202,9 @@ impl AppView {
             feed,
             focus,
             hub,
+            platform_shown: window.visibility().is_visible(),
+            frames_shown: true,
+            _presence: None,
             _resolve: None,
             _page_subscriptions: Vec::new(),
             _subscriptions: subscriptions,
@@ -317,6 +331,28 @@ impl AppView {
     }
 
     /// Hand the current state to `moth status` / MPRIS (they only act on changes).
+    /// Check whether the window is on screen while there's video to suspend, and only then: each
+    /// check draws a frame.
+    fn update_presence(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let wanted = self.session.read(cx).wants_presence(cx);
+        if wanted == self._presence.is_some() {
+            return;
+        }
+        self._presence = wanted.then(|| {
+            presence::watch(window, cx, |this: &mut Self, shown, cx| {
+                this.frames_shown = shown;
+                this.apply_shown(cx);
+            })
+        });
+        self.frames_shown = true;
+        self.apply_shown(cx);
+    }
+
+    fn apply_shown(&mut self, cx: &mut Context<Self>) {
+        let shown = self.platform_shown && self.frames_shown;
+        self.session.update(cx, |session, cx| session.set_shown(shown, cx));
+    }
+
     fn publish(&self, window: &Window, cx: &App) {
         self.hub.publish(self.now_playing(window, cx));
     }

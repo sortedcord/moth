@@ -17,6 +17,12 @@
 //! position, it carries on from the fragment the position is in. Which of the two a stream needs
 //! shows in its first bytes, and an `appsrc` can't change its mind once started, so the source
 //! fetches those before it starts.
+//!
+//! A source can also be suspended ([`Flow`]): it stops fetching, so its branch of the pipeline
+//! runs dry and stops decoding, and when resumed it carries on from the keyframe before the
+//! position it's told, without a seek. The player uses that to drop the video of a window
+//! nobody can see while the audio plays on. It needs a keyframe index: the fragment index of a
+//! fragmented MP4, or the cues of a WebM.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -26,8 +32,8 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 
-use super::mp4_index::{self, Probe};
 use super::stats::NetStats;
+use super::{mp4_index, webm_index};
 use crate::backend::Http;
 use crate::backend::media::Location;
 use crate::sync::lock;
@@ -67,12 +73,34 @@ pub struct Endpoint {
     pub net: NetStats,
     /// The player is gone: nobody is waiting for this stream any more.
     pub closed: bool,
+    pub flow: Flow,
+    /// The source found a keyframe index, so it can be suspended and resumed in place.
+    pub resumable: bool,
+}
+
+/// Whether a source fetches.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Flow {
+    #[default]
+    Running,
+    /// Fetch nothing: what's buffered plays out, then the branch goes idle.
+    Suspended,
+    /// Carry on from the keyframe at or before this position (`Duration::MAX`: the last one).
+    Resume(Duration),
 }
 
 impl Endpoint {
     pub fn new(location: Location, alternate_pending: bool) -> Arc<Mutex<Self>> {
         let alternate = if alternate_pending { Alternate::Pending } else { Alternate::Unavailable };
-        Arc::new(Mutex::new(Self { location, alternate, switched: false, net: NetStats::default(), closed: false }))
+        Arc::new(Mutex::new(Self {
+            location,
+            alternate,
+            switched: false,
+            net: NetStats::default(),
+            closed: false,
+            flow: Flow::Running,
+            resumable: false,
+        }))
     }
 }
 
@@ -170,15 +198,16 @@ fn open(fetcher: Fetcher, appsrc: &gst_app::AppSrc) -> Result<()> {
             Range::Abandoned => return Ok(()),
         }
         let complete = (prefix.len() as u64) <= end || fetcher.size.is_some_and(|size| prefix.len() as u64 >= size);
-        match mp4_index::probe(&prefix) {
+        match Index::probe(&prefix) {
             Probe::Indexed(index) => break Some(index),
             Probe::NeedsBytes(bytes) if !complete && bytes <= MAX_HEADER_BYTES => wanted = bytes.max(wanted),
             Probe::NeedsBytes(_) | Probe::Unindexed => break None,
         }
     };
+    lock(&fetcher.endpoint).resumable = index.is_some();
 
     match &index {
-        Some(index) => {
+        Some(Index::Mp4(index)) => {
             appsrc.set_format(gst::Format::Time);
             appsrc.set_duration(gst::ClockTime::from_nseconds(index.duration.as_nanos() as u64));
             // With a source that works in time, qtdemux passes the media's own timestamps on
@@ -189,14 +218,14 @@ fn open(fetcher: Fetcher, appsrc: &gst_app::AppSrc) -> Result<()> {
                 pad.set_offset(-(index.presentation_offset.as_nanos() as i64));
             }
         }
-        None => {
+        Some(Index::WebM(_)) | None => {
             appsrc.set_format(gst::Format::Bytes);
             appsrc.set_size(fetcher.size.map_or(-1, |size| size as i64));
         }
     }
 
     let state = Arc::new(Mutex::new(RangeState { position: 0, epoch: 0, eos: false, started: false }));
-    let feeder = Feeder { fetcher, prefix, state: state.clone() };
+    let feeder = Feeder { fetcher, prefix, state: state.clone(), index: index.clone() };
     appsrc.set_callbacks(
         gst_app::AppSrcCallbacks::builder()
             .need_data(move |appsrc, _| {
@@ -208,9 +237,9 @@ fn open(fetcher: Fetcher, appsrc: &gst_app::AppSrc) -> Result<()> {
                 let mut state = lock(&state);
                 state.position = match &index {
                     // `offset` is a time in nanoseconds.
-                    Some(index) if state.started => index.fragment_offset(Duration::from_nanos(offset)),
-                    Some(_) => 0,
-                    None => offset,
+                    Some(Index::Mp4(index)) if state.started => index.fragment_offset(Duration::from_nanos(offset)),
+                    Some(Index::Mp4(_)) => 0,
+                    Some(Index::WebM(_)) | None => offset,
                 };
                 state.epoch += 1;
                 state.eos = false;
@@ -360,12 +389,39 @@ struct Feeder {
     /// again.
     prefix: Vec<u8>,
     state: Arc<Mutex<RangeState>>,
+    index: Option<Index>,
 }
 
 impl Feeder {
+    /// Wait while the source is suspended. `None` if the wait was cut short (a flush, or the
+    /// player shutting down); otherwise whether the source just resumed, at a new position.
+    fn wait_while_suspended(&self, appsrc: &gst_app::AppSrc) -> Option<bool> {
+        loop {
+            {
+                let mut endpoint = lock(&self.fetcher.endpoint);
+                match endpoint.flow {
+                    Flow::Running => return Some(false),
+                    Flow::Resume(position) => {
+                        endpoint.flow = Flow::Running;
+                        let Some(index) = &self.index else { return Some(false) };
+                        let mut state = lock(&self.state);
+                        state.position = index.keyframe_offset(position);
+                        state.eos = false;
+                        return Some(true);
+                    }
+                    Flow::Suspended => {}
+                }
+            }
+            if !pause(WAIT_STEP, &|| interrupted(appsrc) || self.fetcher.closed()) {
+                return None;
+            }
+        }
+    }
+
     /// Fetch and push the next chunk.
     fn feed(&self, appsrc: &gst_app::AppSrc) -> Result<()> {
         let state = &*self.state;
+        let Some(resumed) = self.wait_while_suspended(appsrc) else { return Ok(()) };
         let (start, epoch) = {
             let state = lock(state);
             if state.eos {
@@ -413,6 +469,11 @@ impl Feeder {
         }
         let mut buffer = gst::Buffer::from_slice(bytes);
         if let Some(buffer) = buffer.get_mut() {
+            // The demuxer has to drop what it was in the middle of and look for the next
+            // fragment (cluster) header.
+            if resumed {
+                buffer.set_flags(gst::BufferFlags::DISCONT);
+            }
             buffer.set_offset(start);
             buffer.set_offset_end(start + length);
         }
@@ -424,6 +485,45 @@ impl Feeder {
             appsrc.end_of_stream().ok();
         }
         Ok(())
+    }
+}
+
+/// Where a stream's keyframes are, if its first bytes say.
+#[derive(Clone, Debug)]
+enum Index {
+    /// Fragmented MP4. The source works in time for these, and seeks with the index too.
+    Mp4(mp4_index::SegmentIndex),
+    /// WebM with its cues up front. `matroskademux` seeks by itself; this is for resuming.
+    WebM(webm_index::CueIndex),
+}
+
+enum Probe {
+    Unindexed,
+    NeedsBytes(u64),
+    Indexed(Index),
+}
+
+impl Index {
+    fn probe(prefix: &[u8]) -> Probe {
+        match mp4_index::probe(prefix) {
+            mp4_index::Probe::Indexed(index) => return Probe::Indexed(Self::Mp4(index)),
+            mp4_index::Probe::NeedsBytes(bytes) => return Probe::NeedsBytes(bytes),
+            mp4_index::Probe::Unindexed => {}
+        }
+        match webm_index::probe(prefix) {
+            webm_index::Probe::Indexed(index) => Probe::Indexed(Self::WebM(index)),
+            webm_index::Probe::NeedsBytes(bytes) => Probe::NeedsBytes(bytes),
+            webm_index::Probe::Unindexed => Probe::Unindexed,
+        }
+    }
+
+    /// File offset to read from to play from `position`; fragments and clusters start with a
+    /// keyframe.
+    fn keyframe_offset(&self, position: Duration) -> u64 {
+        match self {
+            Self::Mp4(index) => index.fragment_offset(position),
+            Self::WebM(index) => index.cluster_offset(position),
+        }
     }
 }
 

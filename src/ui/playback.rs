@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt as _;
-use gpui::{Context, Task};
+use gpui::{App, Context, Task};
 
 use super::BackendHandle;
 use crate::backend::Backend;
@@ -25,6 +25,9 @@ use crate::settings::Settings;
 
 /// Position, duration and stats refresh while a player exists.
 const TICK: Duration = Duration::from_millis(250);
+/// How long the window has to stay out of sight before video is suspended: switching workspaces
+/// past it, or a moment behind another window, shouldn't cost a catch-up.
+const SUSPEND_AFTER: Duration = Duration::from_secs(1);
 /// Playback moving this much more or less than the clock says counts as a jump.
 const JUMP_THRESHOLD_SECONDS: f64 = 0.5;
 
@@ -127,6 +130,9 @@ pub struct PlaybackSession {
     collect_stats: bool,
     stats: Option<PlayerStats>,
     jumps: JumpDetector,
+    /// When the window went out of sight, if it is.
+    hidden_since: Option<Instant>,
+    video_suspended: bool,
     _resolve: Option<Task<()>>,
     _alternates: Option<Task<()>>,
     _events: Option<Task<()>>,
@@ -155,6 +161,8 @@ impl PlaybackSession {
             collect_stats: false,
             stats: None,
             jumps: JumpDetector::default(),
+            hidden_since: None,
+            video_suspended: false,
             _resolve: None,
             _alternates: None,
             _events: None,
@@ -257,6 +265,7 @@ impl PlaybackSession {
             decoder: self.decoder.clone(),
             resolver: catalog.resolver,
             fallback_urls: self.using_alternates(),
+            video_suspended: self.video_suspended,
         })
     }
 
@@ -294,6 +303,43 @@ impl PlaybackSession {
             .ok();
         }));
         cx.notify();
+    }
+
+    /// Whether the window is on screen. Video is suspended while it isn't, once it's been out of
+    /// sight for a moment, and resumes as soon as it's back.
+    pub fn set_shown(&mut self, shown: bool, cx: &mut Context<Self>) {
+        match (shown, self.hidden_since) {
+            (false, None) => self.hidden_since = Some(Instant::now()),
+            (true, Some(_)) => {
+                self.hidden_since = None;
+                if let Some(suspended) = self.player.as_ref().map(|player| player.set_video_suspended(false))
+                    && self.note_video_suspended(suspended)
+                {
+                    cx.notify();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Record whether video is suspended; returns whether that changed.
+    fn note_video_suspended(&mut self, suspended: bool) -> bool {
+        if suspended == self.video_suspended {
+            return false;
+        }
+        self.video_suspended = suspended;
+        let position = self.position.unwrap_or_default().as_secs_f64();
+        if suspended {
+            eprintln!("moth: window out of sight; video suspended at {position:.1}s");
+        } else {
+            eprintln!("moth: video resumed at {position:.1}s");
+        }
+        true
+    }
+
+    /// Whether checking that the window is on screen is any use: there's video to suspend.
+    pub fn wants_presence(&self, cx: &App) -> bool {
+        self.player.is_some() && cx.global::<Settings>().suspend_hidden_video
     }
 
     /// Stop and forget the video.
@@ -459,6 +505,7 @@ impl PlaybackSession {
         self._alternates = None;
         self.anchor.detach();
         self.player = None;
+        self.video_suspended = false;
     }
 
     fn play_selection(&mut self, selection: Selection, start: Option<Start>, cx: &mut Context<Self>) {
@@ -572,10 +619,14 @@ impl PlaybackSession {
             self.decoder = Some(decoder);
             update(true);
         }
+        let suspend = cx.global::<Settings>().suspend_hidden_video
+            && self.hidden_since.is_some_and(|since| since.elapsed() >= SUSPEND_AFTER);
+        let suspended = player.set_video_suspended(suspend);
         if self.collect_stats {
             self.stats = Some(player.stats());
             update(true);
         }
+        update(self.note_video_suspended(suspended));
         if changed {
             cx.notify();
         }

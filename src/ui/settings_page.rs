@@ -132,6 +132,17 @@ pub fn render(settings: &Settings, error: Option<SharedString>, cx: &mut Context
             "Player debug panel",
             "Show pipeline, decoder and network details under the video (F8 toggles it while watching).",
             switch("player-stats", settings.player_stats, |s| s.player_stats = !s.player_stats, cx),
+        ))
+        .child(row(
+            "Stop video while hidden",
+            "While the window is out of sight, don't download or decode video; audio keeps playing, \
+             and the picture catches up when you come back.",
+            switch(
+                "suspend-hidden-video",
+                settings.suspend_hidden_video,
+                |s| s.suspend_hidden_video = !s.suspend_hidden_video,
+                cx,
+            ),
         ));
 
     let shortcut_list = div().flex().flex_col().gap_2().children(SHORTCUTS.iter().filter_map(|shortcut| {

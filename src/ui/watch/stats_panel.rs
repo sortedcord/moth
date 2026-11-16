@@ -63,6 +63,7 @@ pub fn render(session: &PlaybackSession) -> Option<impl IntoElement + use<>> {
             stats.av_offset_ms.map_or("—".to_string(), |ms| format!("{ms:+.1} ms (last video − last audio pts)")),
         ),
         ("video net", net(&stats.video_net)),
+        ("video", if stats.video_suspended { "suspended: window hidden" } else { "running" }.to_string()),
         ("audio net", net(&stats.audio_net)),
         ("last jump", jump),
     ];

@@ -11,7 +11,9 @@ mod http_source;
 mod mp4_index;
 pub mod stats;
 mod wayland;
+mod webm_index;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,7 +27,7 @@ use gstreamer_video::prelude::*;
 use super::Http;
 use super::media::{AlternateUrls, Location, Selection, StreamCatalog};
 use crate::sync::lock;
-use http_source::{Alternate, Endpoint};
+use http_source::{Alternate, Endpoint, Flow};
 pub use stats::PlayerStats;
 pub use wayland::WaylandTarget;
 
@@ -64,6 +66,9 @@ pub struct PlayerInput {
     /// Alternate URLs are being resolved and will arrive through [`Player::set_alternates`] (or
     /// [`Player::alternates_failed`]); until then a refused request waits for them.
     pub alternates_pending: bool,
+    /// The URLs may refuse to serve far ahead of playback, as the catalog's alternates exist to
+    /// work around (see [`StreamCatalog::has_alternates`]).
+    pub near_only: bool,
 }
 
 impl PlayerInput {
@@ -74,6 +79,7 @@ impl PlayerInput {
             video: StreamInput { location: video.location.clone(), size: video.size, bitrate: video.bitrate },
             audio: StreamInput { location: audio.location.clone(), size: audio.size, bitrate: audio.bitrate },
             alternates_pending,
+            near_only: catalog.has_alternates,
         })
     }
 }
@@ -156,6 +162,9 @@ pub struct Player {
     unmute_on_async_done: bool,
     video_endpoint: Arc<Mutex<Endpoint>>,
     audio_endpoint: Arc<Mutex<Endpoint>>,
+    /// The audio has played to the end (until the next seek).
+    audio_ended: Arc<AtomicBool>,
+    near_only: bool,
 }
 
 impl Player {
@@ -240,6 +249,9 @@ impl Player {
         unsafe { overlay.set_window_handle(target.surface_handle()) };
         overlay.set_render_rectangle(rect.x, rect.y, rect.w, rect.h)?;
 
+        let audio_ended = Arc::new(AtomicBool::new(false));
+        watch_audio_end(&asink, audio_ended.clone(), video_endpoint.clone(), vsink.clone());
+
         let pending_position = start.map(|start| start.position).filter(|position| !position.is_zero());
         volume.set_property("mute", pending_position.is_some());
         let events = events(&pipeline)?;
@@ -261,6 +273,8 @@ impl Player {
             unmute_on_async_done: false,
             video_endpoint,
             audio_endpoint,
+            audio_ended,
+            near_only: input.near_only,
         };
         Ok((player, events))
     }
@@ -351,6 +365,32 @@ impl Player {
         self.pipeline.query_duration::<gst::ClockTime>().map(Duration::from)
     }
 
+    /// Stop fetching and decoding video, or start again: for when nobody can see it. Audio plays
+    /// on either way. On resuming, video picks up at the keyframe before the current position and
+    /// catches up within a second or so.
+    ///
+    /// Returns whether video is now suspended. It isn't for a stream without a keyframe index
+    /// (it couldn't resume in place), before the pipeline has started, or once the audio has
+    /// ended: the pipeline only ends when the video has too. Nor is it when the URL only serves
+    /// near real time and there's no other to switch to: resuming jumps ahead like a seek, which
+    /// that URL would refuse.
+    pub fn set_video_suspended(&self, suspended: bool) -> bool {
+        let mut endpoint = lock(&self.video_endpoint);
+        let reaches = !self.near_only || endpoint.switched || !matches!(endpoint.alternate, Alternate::Unavailable);
+        let suspended =
+            suspended && endpoint.resumable && reaches && self.started && !self.audio_ended.load(Ordering::Acquire);
+        if suspended == (endpoint.flow == Flow::Suspended) {
+            return suspended;
+        }
+        endpoint.flow = if suspended { Flow::Suspended } else { Flow::Resume(self.position().unwrap_or_default()) };
+        set_waits_for_video(&self.video_sink, !suspended);
+        suspended
+    }
+
+    pub fn video_suspended(&self) -> bool {
+        lock(&self.video_endpoint).flow == Flow::Suspended
+    }
+
     pub fn set_alternates(&self, urls: AlternateUrls) {
         lock(&self.video_endpoint).alternate = Alternate::Ready(urls.video);
         lock(&self.audio_endpoint).alternate = Alternate::Ready(urls.audio);
@@ -428,6 +468,7 @@ impl Player {
             av_offset_ms: video_pts.zip(audio_pts).map(|(v, a)| (v as f64 - a as f64) / 1e6),
             video_net: stats::net_stats(&self.video_endpoint, &self.video_src),
             audio_net: stats::net_stats(&self.audio_endpoint, &self.audio_src),
+            video_suspended: self.video_suspended(),
         }
     }
 }
@@ -478,5 +519,39 @@ fn link_decoded_pad(decoder: &gst::Element, downstream: &gst::Element, prefix: &
         {
             eprintln!("moth: failed to link {prefix} pad: {err:?}");
         }
+    });
+}
+
+/// Whether the pipeline waits for the video sink to preroll (show a first frame) after a seek,
+/// a rate change or a pause. A suspended video branch gets no frames, so a pipeline waiting for
+/// one would never play again.
+fn set_waits_for_video(video_sink: &gst::Element, wait: bool) {
+    video_sink.set_property("async", wait);
+}
+
+/// Keep `ended` up to date with whether the audio has played to the end, and resume suspended
+/// video when it has: the pipeline ends only when every branch has, so the video branch must
+/// get to its end too (from its last keyframe, which takes no time).
+fn watch_audio_end(
+    audio_sink: &gst::Element,
+    ended: Arc<AtomicBool>,
+    video: Arc<Mutex<Endpoint>>,
+    video_sink: gst::Element,
+) {
+    let Some(pad) = audio_sink.static_pad("sink") else { return };
+    pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM | gst::PadProbeType::EVENT_FLUSH, move |_, info| {
+        match info.event().map(|event| event.type_()) {
+            Some(gst::EventType::FlushStop) => ended.store(false, Ordering::Release),
+            Some(gst::EventType::Eos) => {
+                ended.store(true, Ordering::Release);
+                let mut video = lock(&video);
+                if video.flow == Flow::Suspended {
+                    video.flow = Flow::Resume(Duration::MAX);
+                    set_waits_for_video(&video_sink, true);
+                }
+            }
+            _ => {}
+        }
+        gst::PadProbeReturn::Ok
     });
 }

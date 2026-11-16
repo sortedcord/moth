@@ -37,6 +37,9 @@ pub struct Settings {
     pub animations: Animations,
     /// Show the player debug panel under the video.
     pub player_stats: bool,
+    /// Stop fetching and decoding video while the window is out of sight (another workspace,
+    /// scrolled away, covered); audio plays on.
+    pub suspend_hidden_video: bool,
     /// Resolve alternate stream URLs in the background for sources that offer them, so
     /// seeking far ahead works (YouTube: web-client URLs via yt-dlp).
     pub seek_fallback: bool,
@@ -66,6 +69,7 @@ impl Default for Settings {
             hide_shorts: true,
             animations: Animations::System,
             player_stats: true,
+            suspend_hidden_video: true,
             seek_fallback: true,
         }
     }
