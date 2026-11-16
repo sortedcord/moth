@@ -150,8 +150,9 @@ vendored at a pinned revision with a small local patch (`patches/`).
 See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the architecture, debug tools and conventions. Source layout:
 
 - `src/backend/`: everything that isn't UI, and nothing that depends on gpui
-  - `source.rs`: the `VideoSource` trait a site implements; `youtube/` is the only one so far (RustyPipe, with
-    yt-dlp as fallback and for seekable alternate URLs)
+  - `source.rs`: the `VideoSource` trait a site implements; `youtube/` is the only site so far (RustyPipe, with
+    yt-dlp as fallback and for seekable alternate URLs), and `local.rs` plays pre-downloaded videos for
+    development (`scripts/fetch-dev-media.sh`)
   - `media.rs`, `selection.rs`: the site-neutral model (videos, streams, codecs) and stream selection
   - `player/`: the GStreamer pipeline, the ranged HTTP source and the Wayland embedding
 - `src/ui/`: the gpui frontend: `mod.rs` (window, navigation, top bar), `playback.rs` (the playback session),

@@ -29,6 +29,23 @@ cargo test
 The dev profile compiles dependencies with optimizations, so the debug build is fast enough to judge
 performance, while moth's own crate stays quick to rebuild.
 
+### Testing without YouTube
+
+Unless you're working on the YouTube source itself, play a local copy instead of hitting YouTube on every run
+(rate limits, and YouTube's quirks getting in the way of what you're actually testing):
+
+```sh
+./scripts/fetch-dev-media.sh        # once: Spring in VP9/AV1/H.264 at 1080p and 480p, Opus and AAC (~220 MB)
+MOTH_OPEN=0 ./target/debug/moth     # the first home card is now the local copy
+./target/debug/moth 'local:spring?t=200'
+```
+
+The files land in `target/dev-media/<name>/` with a `manifest.json` describing them; debug builds pick that
+directory up automatically (`MOTH_DEV_MEDIA=<dir>` points elsewhere, `MOTH_DEV_MEDIA=0` turns it off). The
+`local` source serves them over HTTP on 127.0.0.1 with range requests, so the player, seeking, the quality and
+codec menus, the status socket and MPRIS all behave as with a real site. Pass another video ID and name to the
+script to add more videos. Home cards other than local ones, and related videos, still come from YouTube.
+
 ### Debug tools
 
 | | |
@@ -40,6 +57,7 @@ performance, while moth's own crate stays quick to rebuild.
 | `F10` | 5× slow motion for layout animations |
 | `F8` / `MOTH_PLAYER_STATS=0\|1` | Player debug panel (a setting, on by default): clock, caps, dropped frames, queues, A/V offset, network |
 | `MOTH_FORMAT=<yt-dlp format>` | Override the yt-dlp stream selection (e.g. to force AV1) |
+| `MOTH_DEV_MEDIA=<dir \| 0>` | Where the `local:` dev videos live (default in debug builds: `target/dev-media`) |
 | `moth status --watch` | Follow the running instance's state as JSON |
 | `playerctl -p moth …` | Drive playback without the keyboard (play-pause, `position 30+`, `open <url>`) |
 
