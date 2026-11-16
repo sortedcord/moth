@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! http appsrc → decodebin3 → queue → waylandsink
-//! http appsrc → decodebin3 → queue → audioconvert → volume → scaletempo → audioconvert → audioresample → pipewiresink
+//! http appsrc → decodebin3 → queue → audioconvert → volume → scaletempo → audioconvert → audioresample → pulsesink
 //! ```
 
 mod http_source;
@@ -125,12 +125,11 @@ impl VideoOverlay {
     }
 }
 
-/// Seeking (or changing the rate, which is a seek) flushes the pipeline. Until the pipeline has
-/// reached PLAYING once, pipewiresink's buffer pool is inactive, and if PipeWire negotiates the
-/// format in that window its loop thread waits for the pool while holding the lock a flush needs:
-/// a deadlock (pipewire#5171, <https://gitlab.freedesktop.org/pipewire/pipewire/-/work_items/5171>).
-/// So the player starts straight into PLAYING and holds any seek, rate or pause requested before
-/// then in `pending`, applying it once PLAYING is reached.
+/// The player starts straight into PLAYING and holds any seek, rate or pause requested before
+/// then (`pending_position`, `rate`, `paused`), applying it once PLAYING is reached. Flushing
+/// (seeking, or changing the rate, which is a seek) before the first PLAYING deadlocked with
+/// pipewiresink, moth's earlier audio sink (pipewire#5171, <https://gitlab.freedesktop.org/pipewire/pipewire/-/work_items/5171>);
+/// it also keeps the first audible output from being at the wrong position.
 pub struct Player {
     pipeline: gst::Pipeline,
     video_sink: gst::Element,
@@ -183,13 +182,17 @@ impl Player {
         let tempo = make("scaletempo")?;
         let aconvert_out = make("audioconvert")?;
         let aresample = make("audioresample")?;
-        let asink = make("pipewiresink")?;
-        // pipewiresink's own clock keeps running while the stream is paused and GStreamer doesn't
-        // compensate, so resuming after a pause skipped ahead by the pause length (up to ~5 s,
-        // once WirePlumber suspends the idle device). The monotonic system clock pauses cleanly;
-        // PipeWire resamples the audio to follow it so A/V doesn't drift on long videos.
+        // pulsesink (PipeWire serves it through pipewire-pulse), not pipewiresink:
+        // - pipewiresink's clock keeps running while the stream is paused and jumps when the idle
+        //   device wakes up, so resuming skipped ahead by up to the pause length. The pipeline
+        //   therefore runs on the monotonic system clock, and the sink has to follow that clock.
+        // - pipewiresink's way of following another clock (slave-method=resample) drops ~16 ms of
+        //   audio every second or two: audible crackling. Without it nothing corrects the drift
+        //   between the system and audio-device clocks (tens of ppm; more on Bluetooth/USB).
+        // pulsesink is a GstAudioBaseSink, whose default slaving ("skew") keeps it within
+        // drift-tolerance (40 ms) of the pipeline clock without touching the audio otherwise.
+        let asink = make("pulsesink")?;
         pipeline.use_clock(Some(&gst::SystemClock::obtain()));
-        asink.set_property_from_str("slave-method", "resample");
 
         pipeline.add_many([
             &vsrc,

@@ -41,7 +41,7 @@ moth isn't packaged yet; build it from source. On Arch Linux:
 
 ```sh
 sudo pacman -S rustup gst-plugins-good gst-plugins-bad gst-plugins-bad-libs gst-plugin-va \
-  gst-plugin-pipewire gst-libav yt-dlp deno intel-media-driver vulkan-intel \
+  pipewire-pulse gst-libav yt-dlp deno intel-media-driver vulkan-intel \
   wayland libxkbcommon fontconfig freetype2 cmake clang
 rustup default stable
 git clone https://github.com/sortedcord/moth && cd moth
@@ -50,7 +50,7 @@ cargo build --release
 ./target/release/moth
 ```
 
-Requirements: a Wayland compositor, Vulkan, and PipeWire for audio. `intel-media-driver` and `vulkan-intel` are
+Requirements: a Wayland compositor, Vulkan, and PipeWire (with `pipewire-pulse`) or PulseAudio for audio. `intel-media-driver` and `vulkan-intel` are
 for Intel GPUs; use your GPU's VA-API driver and Vulkan driver instead (e.g. `libva-mesa-driver` and
 `vulkan-radeon` on AMD). yt-dlp (with deno for YouTube's JavaScript challenges) is used as a fallback resolver.
 
@@ -137,10 +137,10 @@ Metadata has the title, channel (`xesam:artist`), thumbnail, URL and length, plu
   RustyPipe fails.
 
 **Playback.** A GStreamer pipeline: ranged `appsrc` → `decodebin3` → `waylandsink` for video and → `scaletempo`
-→ `pipewiresink` for audio. `waylandsink` shares gpui's Wayland connection and attaches a `wl_subsurface` to the
+→ `pulsesink` for audio. `waylandsink` shares gpui's Wayland connection and attaches a `wl_subsurface` to the
 window, positioned wherever the UI lays out the player. The pipeline runs on the system clock (PipeWire's clock
-keeps running while paused, which made resuming skip ahead), and never seeks before it first reaches PLAYING
-(pipewiresink can deadlock otherwise, [pipewire#5171](https://gitlab.freedesktop.org/pipewire/pipewire/-/work_items/5171)).
+keeps running while paused, which made resuming skip ahead), with `pulsesink` (served by pipewire-pulse) following
+it: `pipewiresink`'s clock following crackled, and without it A/V drift went uncorrected.
 
 **UI.** [gpui](https://gpui.rs), Zed's GPU-accelerated UI framework, rendering through wgpu on Vulkan. It's
 vendored at a pinned revision with a small local patch (`patches/`).
