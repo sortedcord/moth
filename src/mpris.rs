@@ -93,7 +93,9 @@ fn metadata_key(now: &NowPlaying) -> impl PartialEq {
     (
         now.video.clone(),
         now.duration.map(micros),
-        now.stream.as_ref().map(|stream| (stream.width, stream.height, stream.fps.map(|fps| fps.to_bits()), stream.quality.clone())),
+        now.stream
+            .as_ref()
+            .map(|stream| (stream.width, stream.height, stream.fps.map(|fps| fps.to_bits()), stream.quality.clone())),
     )
 }
 

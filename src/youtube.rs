@@ -11,7 +11,6 @@ use rustypipe::model::{AudioCodec, AudioStream, Thumbnail, UrlTarget, VideoCodec
 
 use crate::player::StreamUrls;
 
-
 pub struct WatchPage {
     pub title: String,
     pub channel: String,
@@ -48,8 +47,7 @@ impl YouTube {
             .build()
             .context("failed to start tokio runtime")?;
         let storage_dir = cache_dir();
-        std::fs::create_dir_all(&storage_dir)
-            .with_context(|| format!("failed to create {}", storage_dir.display()))?;
+        std::fs::create_dir_all(&storage_dir).with_context(|| format!("failed to create {}", storage_dir.display()))?;
         // RustyPipe's builder spawns background work, so it must be created inside the runtime.
         let client = runtime.block_on(async { RustyPipe::builder().storage_dir(storage_dir).build() })?;
         let http = reqwest::Client::builder().build()?;
@@ -105,7 +103,13 @@ impl YouTube {
                     .or(details.publish_date_txt),
                 likes: details.like_count.map(|n| compact_count(u64::from(n))),
                 description: details.description.to_plaintext(),
-                related: details.recommended.items.into_iter().filter(|item| !item.is_short).map(related_video).collect(),
+                related: details
+                    .recommended
+                    .items
+                    .into_iter()
+                    .filter(|item| !item.is_short)
+                    .map(related_video)
+                    .collect(),
             })
         })
     }
@@ -278,9 +282,9 @@ impl StreamCatalog {
         let fitting = self.video.iter().filter(|option| option.resolution() <= max_height);
         let best_resolution = fitting.clone().map(|option| (option.resolution(), option.fps)).max();
         match best_resolution {
-            Some(best) => fitting
-                .filter(|option| (option.resolution(), option.fps) == best)
-                .min_by_key(|option| rank(option)),
+            Some(best) => {
+                fitting.filter(|option| (option.resolution(), option.fps) == best).min_by_key(|option| rank(option))
+            }
             None => self.video.iter().min_by_key(|option| (option.resolution(), rank(option))),
         }
     }
@@ -352,21 +356,23 @@ impl StreamCatalog {
             height: Some(video.height),
             info: format!(
                 "{} {}x{}@{} · {} · via RustyPipe ({} client)",
-                video.codec, video.width, video.height, video.fps, audio.label(), self.client
+                video.codec,
+                video.width,
+                video.height,
+                video.fps,
+                audio.label(),
+                self.client
             ),
         }
     }
 }
 
 fn related_video(item: VideoItem) -> RelatedVideo {
-    let meta = [
-        item.view_count.map(|n| format!("{} views", compact_count(n))),
-        item.publish_date_txt,
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join(" · ");
+    let meta = [item.view_count.map(|n| format!("{} views", compact_count(n))), item.publish_date_txt]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
     RelatedVideo {
         thumbnail_url: pick_thumbnail(&item.thumbnail),
         channel: item.channel.map(|channel| channel.name).unwrap_or_default(),
@@ -416,7 +422,7 @@ fn grouped_count(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(ch);
@@ -450,15 +456,25 @@ mod tests {
             let auto = catalog.auto_video(720, None).expect("auto video");
             assert!(auto.resolution() <= 720);
             let variants = catalog.video_variants(auto.resolution(), auto.fps);
-            println!("   formats at {}: {:?}", auto.label(), variants.iter().map(|v| (v.codec, v.itag)).collect::<Vec<_>>());
+            println!(
+                "   formats at {}: {:?}",
+                auto.label(),
+                variants.iter().map(|v| (v.codec, v.itag)).collect::<Vec<_>>()
+            );
             let tracks = catalog.tracks();
-            println!("   audio tracks ({}): {:?}", tracks.len(), tracks.iter().take(6).map(|t| (&t.name, t.is_default)).collect::<Vec<_>>());
+            println!(
+                "   audio tracks ({}): {:?}",
+                tracks.len(),
+                tracks.iter().take(6).map(|t| (&t.name, t.is_default)).collect::<Vec<_>>()
+            );
             let audio = catalog.audio_in_track(None);
             println!("   audio (default track): {:?}", audio.iter().map(|a| a.label()).collect::<Vec<_>>());
             assert_eq!(audio.first().map(|a| a.codec), Some("Opus"));
             if let Some(other) = tracks.iter().find(|t| !t.is_default) {
                 let options = catalog.audio_in_track(Some(&other.id));
-                assert!(!options.is_empty() && options.iter().all(|a| a.track.as_ref().map(|t| &t.id) == Some(&other.id)));
+                assert!(
+                    !options.is_empty() && options.iter().all(|a| a.track.as_ref().map(|t| &t.id) == Some(&other.id))
+                );
                 println!("   audio ({}): {:?}", other.name, options.iter().map(|a| a.label()).collect::<Vec<_>>());
             }
         }

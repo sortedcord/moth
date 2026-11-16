@@ -6,9 +6,9 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use gstreamer as gst;
 use gstreamer::glib::translate::from_glib_full;
 use gstreamer::prelude::*;
+use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use gstreamer_video::prelude::*;
-use gstreamer_app as gst_app;
 use std::ffi::c_void;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -60,9 +60,7 @@ pub struct Http {
 /// to fetch specific files.
 pub fn resolve_streams(video_id: &str, format: Option<String>, max_height: u32) -> Result<StreamUrls> {
     // Dev aid: `MOTH_FORMAT=<yt-dlp format>` overrides the default selection (e.g. to force AV1).
-    let format = format
-        .or_else(|| std::env::var("MOTH_FORMAT").ok())
-        .unwrap_or_else(|| default_format(max_height));
+    let format = format.or_else(|| std::env::var("MOTH_FORMAT").ok()).unwrap_or_else(|| default_format(max_height));
     // yt-dlp is a fallback that may run alongside playback, so keep it out of the way.
     let out = Command::new("nice")
         .args([
@@ -219,9 +217,7 @@ impl Player {
         let video_source = Source::new(urls.video.clone(), fallback_pending);
         let audio_source = Source::new(urls.audio.clone(), fallback_pending);
         let make = |name: &str| {
-            gst::ElementFactory::make(name)
-                .build()
-                .with_context(|| format!("missing GStreamer element `{name}`"))
+            gst::ElementFactory::make(name).build().with_context(|| format!("missing GStreamer element `{name}`"))
         };
 
         let pipeline = gst::Pipeline::new();
@@ -248,8 +244,18 @@ impl Player {
         asink.set_property_from_str("slave-method", "resample");
 
         pipeline.add_many([
-            &vsrc, &vdecode, &vqueue, &sink, &asrc, &adecode, &aqueue, &aconvert, &tempo, &aconvert_out,
-            &aresample, &asink,
+            &vsrc,
+            &vdecode,
+            &vqueue,
+            &sink,
+            &asrc,
+            &adecode,
+            &aqueue,
+            &aconvert,
+            &tempo,
+            &aconvert_out,
+            &aresample,
+            &asink,
         ])?;
         vsrc.link(&vdecode)?;
         asrc.link(&adecode)?;
@@ -487,10 +493,7 @@ impl Player {
 
 fn sink_stats(sink: &gst::Element) -> SinkStats {
     let stats = sink.property::<gst::Structure>("stats");
-    SinkStats {
-        rendered: stats.get("rendered").unwrap_or(0),
-        dropped: stats.get("dropped").unwrap_or(0),
-    }
+    SinkStats { rendered: stats.get("rendered").unwrap_or(0), dropped: stats.get("dropped").unwrap_or(0) }
 }
 
 fn queue_level(queue: &gst::Element) -> QueueLevel {
@@ -534,10 +537,8 @@ fn pad_caps(sink: &gst::Element) -> Option<String> {
 fn net_stats(source: &Mutex<Source>, appsrc: &gst::Element) -> NetStats {
     let source = lock(source);
     let mut stats = source.net.clone();
-    stats.host = reqwest::Url::parse(&source.url)
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_string))
-        .unwrap_or_default();
+    stats.host =
+        reqwest::Url::parse(&source.url).ok().and_then(|url| url.host_str().map(str::to_string)).unwrap_or_default();
     stats.queued = appsrc.property("current-level-bytes");
     stats.fallback = match (&source.fallback, source.switched) {
         (_, true) => "switched",
@@ -602,7 +603,9 @@ struct RangeState {
 /// Roughly `CHUNK_SECONDS` of media when the bitrate (bits per second) is known.
 fn chunk_size(bitrate: Option<u32>) -> u64 {
     match bitrate {
-        Some(bitrate) if bitrate > 0 => (u64::from(bitrate) / 8 * CHUNK_SECONDS).clamp(MIN_CHUNK_BYTES, MAX_CHUNK_BYTES),
+        Some(bitrate) if bitrate > 0 => {
+            (u64::from(bitrate) / 8 * CHUNK_SECONDS).clamp(MIN_CHUNK_BYTES, MAX_CHUNK_BYTES)
+        }
         _ => DEFAULT_CHUNK_BYTES,
     }
 }
@@ -613,7 +616,12 @@ enum Fetched {
     Forbidden,
 }
 
-fn range_source(http: Http, source: Arc<Mutex<Source>>, size: Option<u64>, bitrate: Option<u32>) -> Result<gst::Element> {
+fn range_source(
+    http: Http,
+    source: Arc<Mutex<Source>>,
+    size: Option<u64>,
+    bitrate: Option<u32>,
+) -> Result<gst::Element> {
     let chunk = chunk_size(bitrate);
     let appsrc = gst_app::AppSrc::builder()
         .stream_type(gst_app::AppStreamType::Seekable)
@@ -782,10 +790,9 @@ async fn fetch_range(client: &reqwest::Client, url: &str, start: u64, end: u64) 
 fn link_decoded_pad(src: &gst::Element, downstream: &gst::Element, prefix: &'static str) {
     let sink_pad = downstream.static_pad("sink").expect("queue has a sink pad");
     src.connect_pad_added(move |_, pad| {
-        if pad.name().starts_with(prefix) && !sink_pad.is_linked() {
-            if let Err(err) = pad.link(&sink_pad) {
+        if pad.name().starts_with(prefix) && !sink_pad.is_linked()
+            && let Err(err) = pad.link(&sink_pad) {
                 eprintln!("failed to link {prefix} pad: {err:?}");
             }
-        }
     });
 }

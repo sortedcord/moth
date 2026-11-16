@@ -6,11 +6,10 @@
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, Hsla, KeyBinding,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions,
-    div, fill, point, prelude::*, px, relative, size,
+    App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity, EntityInputHandler,
+    EventEmitter, FocusHandle, Focusable, GlobalElementId, Hsla, KeyBinding, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection,
+    UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation as _;
 
@@ -186,17 +185,13 @@ impl TextInput {
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
-            ));
+            cx.write_to_clipboard(ClipboardItem::new_string(self.content[self.selected_range.clone()].to_string()));
         }
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
-            cx.write_to_clipboard(ClipboardItem::new_string(
-                self.content[self.selected_range.clone()].to_string(),
-            ));
+            cx.write_to_clipboard(ClipboardItem::new_string(self.content[self.selected_range.clone()].to_string()));
             self.replace_text_in_range(None, "", window, cx)
         }
     }
@@ -209,11 +204,7 @@ impl TextInput {
     }
 
     fn cursor_offset(&self) -> usize {
-        if self.selection_reversed {
-            self.selected_range.start
-        } else {
-            self.selected_range.end
-        }
+        if self.selection_reversed { self.selected_range.start } else { self.selected_range.end }
     }
 
     fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
@@ -281,11 +272,7 @@ impl TextInput {
     }
 
     fn previous_boundary(&self, offset: usize) -> usize {
-        self.content
-            .grapheme_indices(true)
-            .rev()
-            .find_map(|(idx, _)| (idx < offset).then_some(idx))
-            .unwrap_or(0)
+        self.content.grapheme_indices(true).rev().find_map(|(idx, _)| (idx < offset).then_some(idx)).unwrap_or(0)
     }
 
     fn next_boundary(&self, offset: usize) -> usize {
@@ -315,10 +302,7 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        Some(UTF16Selection {
-            range: self.range_to_utf16(&self.selected_range),
-            reversed: self.selection_reversed,
-        })
+        Some(UTF16Selection { range: self.range_to_utf16(&self.selected_range), reversed: self.selection_reversed })
     }
 
     fn set_selected_text_range(&mut self, range_utf16: Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
@@ -534,7 +518,10 @@ impl Element for TextElement {
             (
                 None,
                 Some(fill(
-                    Bounds::new(point(bounds.left() + cursor_pos, bounds.top()), size(px(2.), bounds.bottom() - bounds.top())),
+                    Bounds::new(
+                        point(bounds.left() + cursor_pos, bounds.top()),
+                        size(px(2.), bounds.bottom() - bounds.top()),
+                    ),
                     input.accent,
                 )),
             )

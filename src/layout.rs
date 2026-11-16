@@ -197,7 +197,8 @@ impl HomeLayout {
 
     /// Height of the scrollable content: covers both where cards are and where they're heading.
     pub fn content_height(&self) -> f32 {
-        let target = self.cards.len().checked_sub(1).map_or(0.0, |last| self.spec.slot(last).1 + card_h(self.spec.card_w));
+        let target =
+            self.cards.len().checked_sub(1).map_or(0.0, |last| self.spec.slot(last).1 + card_h(self.spec.card_w));
         let current = self.cards.iter().map(|card| card.y.value() + card_h(card.w.value())).fold(0.0, f32::max);
         target.max(current)
     }

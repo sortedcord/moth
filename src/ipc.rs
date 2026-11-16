@@ -136,7 +136,10 @@ pub struct Hub {
 impl Hub {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            snapshot: Mutex::new(Snapshot { now: NowPlaying { running: true, ..NowPlaying::not_running() }, at: Instant::now() }),
+            snapshot: Mutex::new(Snapshot {
+                now: NowPlaying { running: true, ..NowPlaying::not_running() },
+                at: Instant::now(),
+            }),
             subscribers: Mutex::new(Vec::new()),
             changes: Mutex::new(None),
         })
@@ -325,12 +328,7 @@ pub fn run_native_host() -> i32 {
 
 fn handle_native_message() -> Result<()> {
     let message = read_native_message()?;
-    let url = message
-        .get("url")
-        .and_then(|url| url.as_str())
-        .context("message has no \"url\"")?
-        .trim()
-        .to_string();
+    let url = message.get("url").and_then(|url| url.as_str()).context("message has no \"url\"")?.trim().to_string();
     if !is_youtube_url(&url) {
         bail!("not a YouTube URL: {url}");
     }

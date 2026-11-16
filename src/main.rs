@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use gpui::{
     AnyElement, App, Bounds, Context, Entity, FocusHandle, Focusable as _, FontWeight, Hsla, Image, ImageFormat,
-    ImageSource, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit, PathBuilder, Pixels, SharedString,
-    Subscription, Task, Window, WindowBounds, WindowDecorations, WindowOptions, anchored, canvas, deferred, div, img,
+    ImageSource, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit, PathBuilder, Pixels, SharedString, Subscription,
+    Task, Window, WindowBounds, WindowDecorations, WindowOptions, anchored, canvas, deferred, div, img,
     linear_color_stop, linear_gradient, point, prelude::*, px, rgb, rgba, size,
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
@@ -555,9 +555,8 @@ impl AppView {
         self.status = Status::Resolving;
         self.subscribed = false;
         self.address_error = None;
-        self.address.update(cx, |input, cx| {
-            input.set_text(format!("https://www.youtube.com/watch?v={id}"), window, cx)
-        });
+        self.address
+            .update(cx, |input, cx| input.set_text(format!("https://www.youtube.com/watch?v={id}"), window, cx));
         let generation = self.generation;
 
         let details = self.youtube.watch_page(id.to_string());
@@ -650,8 +649,12 @@ impl AppView {
             .filter(|_| self.settings.seek_fallback && self.catalog.is_some())
             .map(|(video, audio)| format!("{video}+{audio}"));
         // Replacing the slot drops (and stops) any current player.
-        *self.slot.borrow_mut() =
-            PlayerSlot { pending: Some(urls), start, fallback_pending: fallback_format.is_some(), ..Default::default() };
+        *self.slot.borrow_mut() = PlayerSlot {
+            pending: Some(urls),
+            start,
+            fallback_pending: fallback_format.is_some(),
+            ..Default::default()
+        };
         self.status = Status::Starting;
         cx.notify();
 
@@ -688,8 +691,7 @@ impl AppView {
         if self.video_itag == Some(video_itag) && self.audio_itag == Some(audio_itag) {
             return;
         }
-        let (Some(video), Some(audio)) = (catalog.video_by_itag(video_itag), catalog.audio_by_itag(audio_itag))
-        else {
+        let (Some(video), Some(audio)) = (catalog.video_by_itag(video_itag), catalog.audio_by_itag(audio_itag)) else {
             return;
         };
         let start = Start {
@@ -1068,14 +1070,12 @@ impl Render for AppView {
                     .flex()
                     .flex_row()
                     .gap(px(PAD))
-                    .child(sidebar(self.home_layout.sidebar_w.value(), if on_settings { "Settings" } else { "Home" }, cx))
-                    .map(|row| {
-                        if on_settings {
-                            row.child(self.settings_page(cx))
-                        } else {
-                            row.child(self.home(cx))
-                        }
-                    })
+                    .child(sidebar(
+                        self.home_layout.sidebar_w.value(),
+                        if on_settings { "Settings" } else { "Home" },
+                        cx,
+                    ))
+                    .map(|row| if on_settings { row.child(self.settings_page(cx)) } else { row.child(self.home(cx)) })
                     .into_any_element()
             }
             Route::Watch(_) => self.watch(f32::from(viewport.width), f32::from(viewport.height), cx),
@@ -1089,11 +1089,7 @@ impl Render for AppView {
             .p(px(PAD))
             .font_family("Outfit")
             .text_color(rgb(TEXT))
-            .bg(linear_gradient(
-                160.0,
-                linear_color_stop(rgb(BG_TOP), 0.0),
-                linear_color_stop(rgb(BG_BOTTOM), 1.0),
-            ))
+            .bg(linear_gradient(160.0, linear_color_stop(rgb(BG_TOP), 0.0), linear_color_stop(rgb(BG_BOTTOM), 1.0)))
             .child(body)
     }
 }
@@ -1136,7 +1132,15 @@ impl AppView {
                 );
             }
             let video = &VIDEOS[ix % VIDEOS.len()];
-            cards.push(wire_card(ix, video, motion.x.value(), motion.y.value(), motion.w.value(), show_targets && moving, cx));
+            cards.push(wire_card(
+                ix,
+                video,
+                motion.x.value(),
+                motion.y.value(),
+                motion.w.value(),
+                show_targets && moving,
+                cx,
+            ));
         }
 
         div()
@@ -1155,14 +1159,7 @@ impl AppView {
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&layout.scroll)
-                    .child(
-                        div()
-                            .relative()
-                            .w_full()
-                            .h(px(layout.content_height()))
-                            .children(ghosts)
-                            .children(cards),
-                    ),
+                    .child(div().relative().w_full().h(px(layout.content_height())).children(ghosts).children(cards)),
             )
     }
 
@@ -1204,25 +1201,10 @@ impl AppView {
                             .child(self.controls(false, cx))
                             .when_some(self.playback_error(), |column, error| column.child(error))
                             .when_some(self.stats_panel(), |column, panel| column.child(panel))
-                            .child(
-                                div()
-                                    .id("details")
-                                    .flex_1()
-                                    .min_h_0()
-                                    .overflow_y_scroll()
-                                    .child(self.details(cx)),
-                            ),
+                            .child(div().id("details").flex_1().min_h_0().overflow_y_scroll().child(self.details(cx))),
                     )
                     // Right: recommendations
-                    .child(
-                        div()
-                            .id("recs")
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .overflow_y_scroll()
-                            .child(self.up_next(cx)),
-                    ),
+                    .child(div().id("recs").flex_1().min_w_0().h_full().overflow_y_scroll().child(self.up_next(cx))),
             )
             .into_any_element()
     }
@@ -1269,15 +1251,7 @@ impl AppView {
             .flex()
             .flex_col()
             .gap_1()
-            .child(
-                div()
-                    .px_2()
-                    .pb_2()
-                    .text_xs()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(FAINT))
-                    .child("UP NEXT"),
-            )
+            .child(div().px_2().pb_2().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(FAINT)).child("UP NEXT"))
             .when(matches!(self.page, Page::Loading), |list| {
                 list.child(div().px_2().text_sm().text_color(rgb(FAINT)).child("Loading…"))
             })
@@ -1535,12 +1509,11 @@ impl AppView {
                     .on_click(cx.listener(move |this, _, _, cx| this.menu_action(action.clone(), cx)))
                     .when(page != MenuPage::Main, |row| {
                         row.child(
-                            div()
-                                .w(px(14.0))
-                                .flex_none()
-                                .text_sm()
-                                .text_color(rgb(ACCENT))
-                                .child(if entry.selected { "✓" } else { "" }),
+                            div().w(px(14.0)).flex_none().text_sm().text_color(rgb(ACCENT)).child(if entry.selected {
+                                "✓"
+                            } else {
+                                ""
+                            }),
                         )
                     })
                     .child(
@@ -1597,15 +1570,7 @@ impl AppView {
                         .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(title)),
                 )
             })
-            .child(
-                div()
-                    .id("menu-rows")
-                    .max_h(px(max_list_h))
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .children(rows),
-            );
+            .child(div().id("menu-rows").max_h(px(max_list_h)).overflow_y_scroll().flex().flex_col().children(rows));
 
         let (corner, anchor, offset) = if fullscreen {
             (gpui::Anchor::TopRight, gpui::Anchor::BottomRight, point(px(0.0), px(-8.0)))
@@ -1626,7 +1591,9 @@ impl AppView {
         let kib = |bytes: u64| format!("{:.0} KiB", bytes as f64 / 1024.0);
         // GStreamer resets these counters on every pause/resume.
         let sink = |s: player::SinkStats| format!("{} rendered · {} dropped (since last play)", s.rendered, s.dropped);
-        let queue = |q: player::QueueLevel| format!("{} buf · {} · {:.0} ms", q.buffers, kib(q.bytes as u64), q.time_ns as f64 / 1e6);
+        let queue = |q: player::QueueLevel| {
+            format!("{} buf · {} · {:.0} ms", q.buffers, kib(q.bytes as u64), q.time_ns as f64 / 1e6)
+        };
         let net = |n: &player::NetStats| {
             format!(
                 "{} · {} req · {} 403 · last {:.1} MiB/s in {} ms · {} queued · fallback {}",
@@ -1644,7 +1611,16 @@ impl AppView {
         });
         let rows: Vec<(&str, String)> = vec![
             ("state", format!("{} · {}", stats.state, self.decoder.as_deref().unwrap_or("decoder —"))),
-            ("clock", format!("{} · running {} · position {} · rate {}×", stats.clock, secs(stats.running_ns), secs(stats.position_ns), stats.rate)),
+            (
+                "clock",
+                format!(
+                    "{} · running {} · position {} · rate {}×",
+                    stats.clock,
+                    secs(stats.running_ns),
+                    secs(stats.position_ns),
+                    stats.rate
+                ),
+            ),
             ("stream", self.stream_info.clone().unwrap_or_default()),
             ("video caps", stats.video_caps.clone().unwrap_or_default()),
             ("audio caps", stats.audio_caps.clone().unwrap_or_default()),
@@ -1652,7 +1628,10 @@ impl AppView {
             ("audio sink", sink(stats.audio_sink)),
             ("video queue", queue(stats.video_queue)),
             ("audio queue", queue(stats.audio_queue)),
-            ("a/v offset", stats.av_offset_ms.map_or("—".to_string(), |ms| format!("{ms:+.1} ms (last video − last audio pts)"))),
+            (
+                "a/v offset",
+                stats.av_offset_ms.map_or("—".to_string(), |ms| format!("{ms:+.1} ms (last video − last audio pts)")),
+            ),
             ("video net", format!("{} · {}", stats.video_net.host, net(&stats.video_net))),
             ("audio net", format!("{} · {}", stats.audio_net.host, net(&stats.audio_net))),
             ("last jump", jump),
@@ -1723,13 +1702,11 @@ impl AppView {
                         pause_icon().into_any_element()
                     }),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(MUTED))
-                    .flex_none()
-                    .child(format!("{} / {}", fmt_time(position), fmt_time(duration))),
-            )
+            .child(div().text_xs().text_color(rgb(MUTED)).flex_none().child(format!(
+                "{} / {}",
+                fmt_time(position),
+                fmt_time(duration)
+            )))
             .child(
                 // Seek bar: generous hit area, thin track.
                 div()
@@ -1906,11 +1883,7 @@ impl AppView {
                     .gap_2()
                     .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(stats))
                     .child(
-                        div()
-                            .text_sm()
-                            .text_color(rgb(MUTED))
-                            .line_height(px(21.0))
-                            .child(page.description.clone()),
+                        div().text_sm().text_color(rgb(MUTED)).line_height(px(21.0)).child(page.description.clone()),
                     ),
             )
             .when_some(tech, |column, tech| column.child(div().text_xs().text_color(rgb(FAINT)).child(tech)))
@@ -1957,9 +1930,11 @@ impl AppView {
 
     fn settings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let section = |title: &'static str| {
-            div().flex().flex_col().gap_2().child(
-                div().px_1().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(FAINT)).child(title),
-            )
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(div().px_1().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(FAINT)).child(title))
         };
         let row = |label: &'static str, description: &'static str| {
             div()
@@ -1983,8 +1958,8 @@ impl AppView {
                 )
         };
 
-        let resolution = div().flex().gap_1().p_1().rounded_full().bg(rgb(BG_BOTTOM)).children(
-            RESOLUTIONS.map(|height| {
+        let resolution =
+            div().flex().gap_1().p_1().rounded_full().bg(rgb(BG_BOTTOM)).children(RESOLUTIONS.map(|height| {
                 let selected = self.settings.max_height == height;
                 div()
                     .id(("resolution", height as usize))
@@ -2005,8 +1980,7 @@ impl AppView {
                         this.update_settings(|settings| settings.max_height = height, cx)
                     }))
                     .child(format!("{height}p"))
-            }),
-        );
+            }));
 
         let seek_fallback = self.settings.seek_fallback;
         let toggle = div()
@@ -2040,22 +2014,19 @@ impl AppView {
                 .items_center()
                 .gap_4()
                 .child(
-                    div()
-                        .w(px(96.0))
-                        .flex_none()
-                        .child(
-                            div()
-                                .px_2()
-                                .py_0p5()
-                                .rounded_md()
-                                .bg(rgb(BG_BOTTOM))
-                                .border_1()
-                                .border_color(rgb(TRACK))
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(TEXT))
-                                .child(keys),
-                        ),
+                    div().w(px(96.0)).flex_none().child(
+                        div()
+                            .px_2()
+                            .py_0p5()
+                            .rounded_md()
+                            .bg(rgb(BG_BOTTOM))
+                            .border_1()
+                            .border_color(rgb(TRACK))
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(TEXT))
+                            .child(keys),
+                    ),
                 )
                 .child(div().text_sm().text_color(rgb(MUTED)).child(action))
         }));
@@ -2124,7 +2095,8 @@ impl AppView {
     }
 
     fn top_bar(&self, back: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let on_back = back.then(|| cx.listener(|this: &mut AppView, _: &gpui::ClickEvent, window, cx| this.go_home(window, cx)));
+        let on_back =
+            back.then(|| cx.listener(|this: &mut AppView, _: &gpui::ClickEvent, window, cx| this.go_home(window, cx)));
         let address_focused = self.address_focused;
         div()
             .flex()
@@ -2351,7 +2323,12 @@ fn wire_card(
                 .child(div().absolute().bottom_1().right_2().text_xs().child(video.duration)),
         )
         .child(line().pt_1().text_sm().child(video.title))
-        .child(line().text_xs().text_color(rgb(MUTED)).child(format!("{} · {} · {}", video.channel, video.views, video.age)))
+        .child(
+            line()
+                .text_xs()
+                .text_color(rgb(MUTED))
+                .child(format!("{} · {} · {}", video.channel, video.views, video.age)),
+        )
 }
 
 fn thumbnail(source: Option<ImageSource>, duration: Option<String>, w: Pixels, h: Pixels) -> impl IntoElement {
@@ -2528,7 +2505,9 @@ fn fullscreen_icon(exit: bool) -> impl IntoElement {
             let k = s * 0.36;
             let mut path = PathBuilder::stroke(px(1.8));
             // (corner, horizontal direction into the icon, vertical direction into the icon)
-            for (cx, cy, dx, dy) in [(x, y, 1.0, 1.0), (x + s, y, -1.0, 1.0), (x, y + s, 1.0, -1.0), (x + s, y + s, -1.0, -1.0)] {
+            for (cx, cy, dx, dy) in
+                [(x, y, 1.0, 1.0), (x + s, y, -1.0, 1.0), (x, y + s, 1.0, -1.0), (x + s, y + s, -1.0, -1.0)]
+            {
                 if exit {
                     path.move_to(point(cx + k * dx, cy));
                     path.line_to(point(cx + k * dx, cy + k * dy));
