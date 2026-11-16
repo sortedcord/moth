@@ -2,6 +2,9 @@
 name = "moth"
 version = "0.1.0"
 edition = "2024"
+description = "A fast, native YouTube client for the Linux desktop"
+license = "GPL-3.0-only"
+repository = "https://github.com/sortedcord/moth"
 publish = false
 
 [dependencies]

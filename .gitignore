@@ -2,3 +2,4 @@
 /vendor
 # Chromium writes compiled rule caches here when the extension is loaded unpacked.
 /extension/_metadata
+AGENTS.md
