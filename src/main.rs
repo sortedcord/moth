@@ -1,5 +1,7 @@
 mod data;
 mod ipc;
+mod layout;
+mod mpris;
 mod player;
 mod settings;
 mod text_input;
@@ -21,7 +23,8 @@ use gpui::{
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 
 use data::VIDEOS;
-use player::{Player, PlayerEvent, Rect, Start, StreamUrls};
+use layout::{HomeLayout, PAD, RAIL_W, SIDEBAR_W};
+use player::{Player, PlayerEvent, PlayerStats, Rect, Start, StreamUrls};
 use settings::{RESOLUTIONS, Settings};
 use text_input::{Submit, TextInput};
 use youtube::{RelatedVideo, StreamCatalog, WatchPage, YouTube};
@@ -37,21 +40,22 @@ const MUTED: u32 = 0x9aa3bb;
 const FAINT: u32 = 0x6b7490;
 const ACCENT: u32 = 0xe94b5a;
 
-const SIDEBAR_W: f32 = 220.0;
 /// Vertical space kept free below/above the player: padding, top bar, controls and a peek of
 /// the title, so tall videos don't push everything off-screen.
 const PLAYER_RESERVED_H: f32 = 300.0;
-/// Width of the collapsed sidebar (icon rail).
-const RAIL_W: f32 = 76.0;
-/// Below this window width the watch page stacks into a single column and the sidebar collapses.
+/// Below this window width the watch page stacks into a single column.
 const NARROW_W: f32 = 1000.0;
 const SWITCHED_NOTE: &str = " · switched to web-client URLs for seeking";
-const PAD: f32 = 16.0;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if ipc::is_native_host_invocation(&args) {
         std::process::exit(ipc::run_native_host());
+    }
+    // `moth status [--watch]`: report what the running instance is doing, as JSON lines.
+    if args.first().is_some_and(|arg| arg == "status") {
+        let watch = args.iter().skip(1).any(|arg| arg == "--watch" || arg == "-w");
+        std::process::exit(ipc::run_status_cli(watch));
     }
     // `moth <url>`: hand it to a running instance if there is one.
     let url_arg = args.into_iter().find(|arg| !arg.starts_with('-'));
@@ -60,13 +64,24 @@ fn main() {
     {
         return;
     }
-    let incoming = match ipc::listen() {
-        Ok(incoming) => Some(incoming),
+    // Commands from the socket and MPRIS, handled on the UI thread as they arrive.
+    let (commands, command_queue) = async_channel::unbounded();
+    let hub = ipc::Hub::new();
+    if let Err(err) = ipc::listen(commands.clone(), hub.clone()) {
+        eprintln!("moth: links from other launches and `moth status` won't reach this window: {err:#}");
+    }
+    let mpris = match mpris::Mpris::start(hub.clone(), commands.clone()) {
+        Ok(mpris) => Some(mpris),
         Err(err) => {
-            eprintln!("moth: links from other launches won't reach this window: {err:#}");
+            eprintln!("moth: MPRIS unavailable (media keys and bars won't see moth): {err}");
             None
         }
     };
+    hub.start_worker(move |previous, now| {
+        if let Some(mpris) = &mpris {
+            mpris.changed(previous, now);
+        }
+    });
 
     if let Err(err) = gstreamer::init() {
         eprintln!("moth: failed to initialize GStreamer: {err}");
@@ -103,7 +118,7 @@ fn main() {
             },
             |window, cx| {
                 cx.new(|cx| {
-                    let mut view = AppView::new(youtube, incoming, window, cx);
+                    let mut view = AppView::new(youtube, hub, command_queue, window, cx);
                     // Dev aid: `MOTH_OPEN=<home card index | YouTube URL | video ID>` opens it on startup.
                     if let Some(url) = url_arg {
                         view.submit_address(url, window, cx);
@@ -249,19 +264,40 @@ struct AppView {
     stream_generation: u64,
     subscribed: bool,
     seek_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    home_layout: HomeLayout,
+    /// Debug panel under the player (F8).
+    show_player_stats: bool,
+    player_stats: Option<PlayerStats>,
+    /// Position sample from the previous poll, to catch playback jumping (wall time, position ns).
+    last_position_sample: Option<(std::time::Instant, u64)>,
+    /// Most recent discontinuity: (seconds jumped beyond the expected advance, when).
+    last_jump: Option<(f64, std::time::Instant)>,
+    /// What's playing, for `moth status` and MPRIS.
+    hub: Arc<ipc::Hub>,
+    position_ns: Option<u64>,
+    /// Decoded (width, height, fps).
+    video_format: Option<(u32, u32, Option<f64>)>,
     _poll: Task<()>,
+    _commands: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl AppView {
     fn new(
         youtube: Arc<YouTube>,
-        incoming: Option<std::sync::mpsc::Receiver<String>>,
+        hub: Arc<ipc::Hub>,
+        command_queue: async_channel::Receiver<ipc::Command>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let focus = cx.focus_handle();
         window.focus(&focus, cx);
+        // Dev aid: `MOTH_FRAME_STATS=1` shows gpui's frame-time overlay from the start (F12 cycles it).
+        if std::env::var_os("MOTH_FRAME_STATS").is_some() {
+            window.set_debug_frame_overlay_mode(gpui::DebugFrameOverlayMode::Full);
+        }
+        // Dev aid: `MOTH_CARDS=<n>` fills the home grid with n cards (cycling the mock videos).
+        let card_count = std::env::var("MOTH_CARDS").ok().and_then(|n| n.parse().ok()).unwrap_or(VIDEOS.len());
 
         let address = cx.new(|cx| {
             TextInput::new(
@@ -281,15 +317,23 @@ impl AppView {
             loop {
                 cx.background_executor().timer(Duration::from_millis(250)).await;
                 let tick = this.update_in(cx, |this, window, cx| {
-                    // Links handed over by `moth <url>` or the browser extension.
-                    let urls: Vec<String> = incoming.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
-                    if let Some(url) = urls.into_iter().last() {
-                        window.activate_window();
-                        this.submit_address(url, window, cx);
-                    }
-                    this.poll(cx)
+                    this.poll(cx);
+                    this.publish(window, cx);
                 });
                 if tick.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Links from `moth <url>` / the browser extension, and MPRIS controls.
+        let commands = cx.spawn_in(window, async move |this, cx| {
+            while let Ok(command) = command_queue.recv().await {
+                let handled = this.update_in(cx, |this, window, cx| {
+                    this.handle_command(command, window, cx);
+                    this.publish(window, cx);
+                });
+                if handled.is_err() {
                     break;
                 }
             }
@@ -325,8 +369,161 @@ impl AppView {
             stream_generation: 0,
             subscribed: false,
             seek_bounds: Rc::default(),
+            home_layout: HomeLayout::new(card_count),
+            show_player_stats: std::env::var("MOTH_PLAYER_STATS").map_or(true, |value| value != "0"),
+            player_stats: None,
+            last_position_sample: None,
+            last_jump: None,
+            hub,
+            position_ns: None,
+            video_format: None,
             _poll: poll,
+            _commands: commands,
             _subscriptions: subscriptions,
+        }
+    }
+
+    fn handle_command(&mut self, command: ipc::Command, window: &mut Window, cx: &mut Context<Self>) {
+        use ipc::Command;
+        match command {
+            Command::Open(url) => {
+                // Wayland only lets us ask for attention here, not take focus.
+                window.activate_window();
+                self.submit_address(url, window, cx);
+            }
+            Command::Play => match self.status {
+                Status::Paused => self.toggle_pause(cx),
+                Status::Ended => self.restart(cx),
+                _ => {}
+            },
+            Command::Pause => {
+                if self.status == Status::Playing {
+                    self.toggle_pause(cx);
+                }
+            }
+            Command::PlayPause => match self.status {
+                Status::Playing | Status::Paused => self.toggle_pause(cx),
+                Status::Ended => self.restart(cx),
+                _ => {}
+            },
+            Command::Stop => {
+                if matches!(self.route, Route::Watch(_)) {
+                    self.go_home(window, cx);
+                }
+            }
+            Command::Seek(offset_us) => {
+                let position = self.slot.borrow().player.as_ref().and_then(Player::position_ns);
+                if let Some(position) = position {
+                    // Seeking back past the start goes to the start.
+                    self.seek_to_ns((position as i64 + offset_us * 1000).max(0));
+                }
+            }
+            Command::SetPosition(position_us) => {
+                if position_us >= 0 {
+                    self.seek_to_ns(position_us * 1000);
+                }
+            }
+            Command::SetRate(rate) => self.menu_action(MenuAction::Speed(rate), cx),
+            Command::Raise => window.activate_window(),
+            Command::Quit => {
+                // Quitting this way skips the window-closed hook that normally removes it.
+                ipc::remove_socket();
+                cx.quit();
+            }
+        }
+    }
+
+    /// Seek, clamped to the video. Positions past the end are ignored (MPRIS says so).
+    fn seek_to_ns(&self, target: i64) {
+        let duration = self.duration.map(|seconds| seconds as i64 * 1_000_000_000);
+        if duration.is_some_and(|duration| target > duration) {
+            return;
+        }
+        if let Some(player) = self.slot.borrow().player.as_ref() {
+            player.seek_ns(target.max(0) as u64);
+        }
+    }
+
+    /// Play an ended video again from the start.
+    fn restart(&mut self, cx: &mut Context<Self>) {
+        let slot = self.slot.borrow();
+        let Some(player) = slot.player.as_ref() else { return };
+        player.seek_ns(0);
+        drop(slot);
+        self.status = Status::Playing;
+        cx.notify();
+    }
+
+    /// Hand the current state to `moth status` / MPRIS (they only act on changes).
+    fn publish(&self, window: &Window, cx: &App) {
+        self.hub.publish(self.now_playing(window, cx));
+    }
+
+    fn now_playing(&self, window: &Window, _cx: &App) -> ipc::NowPlaying {
+        let (status, error) = match &self.status {
+            Status::Idle => ("idle", None),
+            Status::Resolving => ("resolving", None),
+            Status::Starting => ("buffering", None),
+            Status::Playing => ("playing", None),
+            Status::Paused => ("paused", None),
+            Status::Ended => ("ended", None),
+            Status::Error(err) => ("error", Some(err.clone())),
+        };
+        let video = match &self.route {
+            Route::Watch(id) => {
+                let page = match &self.page {
+                    Page::Loaded(page) => Some(page),
+                    _ => None,
+                };
+                Some(ipc::VideoInfo {
+                    id: id.to_string(),
+                    url: format!("https://www.youtube.com/watch?v={id}"),
+                    title: page.map(|page| page.title.clone()),
+                    channel: page.map(|page| page.channel.clone()),
+                    thumbnail: format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"),
+                })
+            }
+            _ => None,
+        };
+        let stream = video.as_ref().and(self.stream_info.as_ref()).map(|_| {
+            let catalog = self.catalog.as_deref();
+            let video_option = catalog.zip(self.video_itag).and_then(|(catalog, itag)| catalog.video_by_itag(itag));
+            let audio_option = catalog.zip(self.audio_itag).and_then(|(catalog, itag)| catalog.audio_by_itag(itag));
+            let decoded = self.video_format;
+            let width = decoded.map(|(width, _, _)| width).or(video_option.map(|video| video.width));
+            let height = decoded.map(|(_, height, _)| height).or(video_option.map(|video| video.height));
+            ipc::StreamInfo {
+                width,
+                height,
+                fps: decoded.and_then(|(_, _, fps)| fps).or(video_option.map(|video| f64::from(video.fps))),
+                // Without the catalog (yt-dlp), go by the decoded size like YouTube does.
+                quality: video_option.map(|video| video.label()).or_else(|| {
+                    let short_side = width?.min(height?);
+                    Some(format!("{short_side}p"))
+                }),
+                quality_auto: self.quality_auto,
+                video_codec: video_option.map(|video| video.codec.to_string()),
+                audio_codec: audio_option.map(|audio| audio.codec.to_string()),
+                decoder: self.decoder.clone(),
+                resolver: if catalog.is_some() { "rustypipe" } else { "yt-dlp" },
+                fallback_urls: self.slot.borrow().player.as_ref().is_some_and(Player::using_fallback),
+            }
+        });
+        ipc::NowPlaying {
+            running: true,
+            page: match self.route {
+                Route::Home => "home",
+                Route::Watch(_) => "watch",
+                Route::Settings => "settings",
+            },
+            status,
+            error,
+            position: video.as_ref().and(self.position_ns).map(|ns| ns as f64 / 1e9),
+            duration: video.as_ref().and(self.duration).map(|seconds| seconds as f64),
+            video,
+            rate: self.rate,
+            stream,
+            fullscreen: window.is_fullscreen(),
         }
     }
 
@@ -434,6 +631,7 @@ impl AppView {
     /// enabled, resolve web-client URLs for the same files so seeking far ahead works.
     fn begin_playback(&mut self, urls: StreamUrls, start: Option<Start>, cx: &mut Context<Self>) {
         self.stream_generation += 1;
+        self.last_position_sample = None;
         self.stream_info = Some(urls.info.clone());
         self.video_itag = urls.video_itag;
         self.audio_itag = urls.audio_itag;
@@ -623,6 +821,11 @@ impl AppView {
         self.audio_itag = None;
         self.quality_auto = true;
         self.menu = None;
+        self.player_stats = None;
+        self.last_position_sample = None;
+        self.last_jump = None;
+        self.position_ns = None;
+        self.video_format = None;
     }
 
     fn toggle_pause(&mut self, cx: &mut Context<Self>) {
@@ -686,6 +889,28 @@ impl AppView {
                 (self.position, self.duration) = (position, duration);
                 changed = true;
             }
+            // Discontinuity detector: while playing, position should advance by wall time × rate.
+            // (Seeks show up here too.)
+            let stats = player.stats();
+            let now = std::time::Instant::now();
+            self.position_ns = stats.position_ns;
+            self.video_format = player.video_format();
+            if self.status == Status::Playing
+                && let (Some(position), Some((then, previous))) = (stats.position_ns, self.last_position_sample)
+            {
+                let expected = (now - then).as_secs_f64() * stats.rate;
+                let actual = (position as f64 - previous as f64) / 1e9;
+                if (actual - expected).abs() > 0.5 {
+                    eprintln!("moth: playback jumped {:+.2}s (expected {expected:+.2}s)", actual - expected);
+                    self.last_jump = Some((actual - expected, now));
+                }
+            }
+            self.last_position_sample =
+                (self.status == Status::Playing).then_some(stats.position_ns.map(|position| (now, position))).flatten();
+            if self.show_player_stats {
+                self.player_stats = Some(stats);
+                changed = true;
+            }
             if player.using_fallback()
                 && let Some(info) = self.stream_info.as_mut()
                 && !info.ends_with(SWITCHED_NOTE)
@@ -733,6 +958,29 @@ impl AppView {
                 window.focus(&self.focus, cx);
             }
             return;
+        }
+        // Debug keys, on every page.
+        match event.keystroke.key.as_str() {
+            "f9" => {
+                self.home_layout.show_targets = !self.home_layout.show_targets;
+                cx.notify();
+                return;
+            }
+            "f10" => {
+                self.home_layout.slow_motion = !self.home_layout.slow_motion;
+                cx.notify();
+                return;
+            }
+            "f12" => {
+                window.cycle_debug_frame_overlay_mode();
+                return;
+            }
+            "f8" => {
+                self.show_player_stats = !self.show_player_stats;
+                cx.notify();
+                return;
+            }
+            _ => {}
         }
         if !matches!(self.route, Route::Watch(_)) {
             return;
@@ -811,19 +1059,21 @@ impl Render for AppView {
         }
         let body = match &self.route {
             Route::Home | Route::Settings => {
-                let collapsed = f32::from(viewport.width) < NARROW_W;
+                if self.home_layout.step(f32::from(viewport.width), cx.reduce_motion()) {
+                    window.request_animation_frame();
+                }
                 let on_settings = self.route == Route::Settings;
                 div()
                     .size_full()
                     .flex()
                     .flex_row()
                     .gap(px(PAD))
-                    .child(sidebar(collapsed, if on_settings { "Settings" } else { "Home" }, cx))
+                    .child(sidebar(self.home_layout.sidebar_w.value(), if on_settings { "Settings" } else { "Home" }, cx))
                     .map(|row| {
                         if on_settings {
                             row.child(self.settings_page(cx))
                         } else {
-                            row.child(self.home(f32::from(viewport.width), collapsed, cx))
+                            row.child(self.home(cx))
                         }
                     })
                     .into_any_element()
@@ -849,12 +1099,45 @@ impl Render for AppView {
 }
 
 impl AppView {
-    fn home(&self, viewport_w: f32, sidebar_collapsed: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let sidebar_w = if sidebar_collapsed { RAIL_W } else { SIDEBAR_W } + PAD;
-        let main_w = viewport_w - 2.0 * PAD - sidebar_w;
-        let columns = if main_w > 1300.0 { 5.0 } else if main_w > 900.0 { 4.0 } else if main_w > 560.0 { 3.0 } else { 2.0 };
-        let gap = 12.0;
-        let card_w = ((main_w - 8.0 - gap * (columns - 1.0)) / columns).floor();
+    /// Wireframe home grid. Cards are absolutely positioned at their spring-animated geometry
+    /// (see `layout.rs`), and only the ones near the scroll viewport are built.
+    fn home(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let layout = &self.home_layout;
+        let show_targets = layout.show_targets;
+        let visible: Vec<usize> = layout.visible(self.viewport_h).collect();
+        let hud = format!(
+            "{} cols · card {:.1}px · {}/{} visible · {} moving · step {:.1}ms{}   [F9 targets{}] [F10 slow-mo] [F12 frame stats]",
+            layout.spec.columns,
+            layout.spec.card_w,
+            visible.len(),
+            layout.cards.len(),
+            layout.moving,
+            layout.dt * 1000.0,
+            if layout.slow_motion { " · SLOW-MO" } else { "" },
+            if show_targets { " on" } else { "" },
+        );
+
+        let mut ghosts = Vec::new();
+        let mut cards = Vec::with_capacity(visible.len());
+        for ix in visible {
+            let motion = layout.cards[ix];
+            let moving = motion.is_moving();
+            if show_targets && moving {
+                ghosts.push(
+                    div()
+                        .absolute()
+                        .left(px(motion.x.target()))
+                        .top(px(motion.y.target()))
+                        .w(px(motion.w.target()))
+                        .h(px(layout::card_h(motion.w.target())))
+                        .border_1()
+                        .border_dashed()
+                        .border_color(rgba(0xe94b5a80)),
+                );
+            }
+            let video = &VIDEOS[ix % VIDEOS.len()];
+            cards.push(wire_card(ix, video, motion.x.value(), motion.y.value(), motion.w.value(), show_targets && moving, cx));
+        }
 
         div()
             .flex_1()
@@ -862,25 +1145,23 @@ impl AppView {
             .min_w_0()
             .flex()
             .flex_col()
-            .gap_5()
+            .gap_3()
             .child(self.top_bar(false, cx))
+            .child(div().flex_none().whitespace_nowrap().overflow_hidden().text_xs().text_color(rgb(MUTED)).child(hud))
             .child(
                 div()
                     .id("home-scroll")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
+                    .track_scroll(&layout.scroll)
                     .child(
                         div()
-                            .flex()
-                            .flex_col()
-                            .gap_4()
-                            .child(section_heading("Blender Open Movies", "PLAY ALL"))
-                            .child(
-                                div().flex().flex_wrap().gap(px(gap)).children(
-                                    VIDEOS.iter().enumerate().map(|(ix, video)| video_card(ix, video, card_w, cx)),
-                                ),
-                            ),
+                            .relative()
+                            .w_full()
+                            .h(px(layout.content_height()))
+                            .children(ghosts)
+                            .children(cards),
                     ),
             )
     }
@@ -922,6 +1203,7 @@ impl AppView {
                             .child(div().flex().justify_center().child(self.video_surface(frame_w, frame_h, cx)))
                             .child(self.controls(false, cx))
                             .when_some(self.playback_error(), |column, error| column.child(error))
+                            .when_some(self.stats_panel(), |column, panel| column.child(panel))
                             .child(
                                 div()
                                     .id("details")
@@ -965,6 +1247,7 @@ impl AppView {
                     .child(div().flex().justify_center().child(self.video_surface(frame_w, frame_h, cx)))
                     .child(self.controls(false, cx))
                     .when_some(self.playback_error(), |column, error| column.child(error))
+                    .when_some(self.stats_panel(), |column, panel| column.child(panel))
                     .child(
                         div()
                             .id("details")
@@ -1330,6 +1613,71 @@ impl AppView {
             (gpui::Anchor::BottomRight, gpui::Anchor::TopRight, point(px(0.0), px(8.0)))
         };
         Some(deferred(anchored().attach(gear, corner).anchor(anchor).offset(offset).child(menu)).with_priority(1))
+    }
+
+    /// Debug readout of the pipeline (F8). Sits below the controls: the video subsurface is
+    /// stacked above the gpui surface, so nothing can be drawn over the picture.
+    fn stats_panel(&self) -> Option<impl IntoElement + use<>> {
+        if !self.show_player_stats {
+            return None;
+        }
+        let stats = self.player_stats.as_ref()?;
+        let secs = |ns: Option<u64>| ns.map_or("—".to_string(), |ns| format!("{:.3}s", ns as f64 / 1e9));
+        let kib = |bytes: u64| format!("{:.0} KiB", bytes as f64 / 1024.0);
+        // GStreamer resets these counters on every pause/resume.
+        let sink = |s: player::SinkStats| format!("{} rendered · {} dropped (since last play)", s.rendered, s.dropped);
+        let queue = |q: player::QueueLevel| format!("{} buf · {} · {:.0} ms", q.buffers, kib(q.bytes as u64), q.time_ns as f64 / 1e6);
+        let net = |n: &player::NetStats| {
+            format!(
+                "{} · {} req · {} 403 · last {:.1} MiB/s in {} ms · {} queued · fallback {}",
+                kib(n.bytes),
+                n.requests,
+                n.forbidden,
+                n.last_rate / (1024.0 * 1024.0),
+                n.last_request_ms,
+                kib(n.queued),
+                n.fallback,
+            )
+        };
+        let jump = self.last_jump.map_or("none".to_string(), |(seconds, at)| {
+            format!("{seconds:+.2}s, {:.0}s ago", at.elapsed().as_secs_f64())
+        });
+        let rows: Vec<(&str, String)> = vec![
+            ("state", format!("{} · {}", stats.state, self.decoder.as_deref().unwrap_or("decoder —"))),
+            ("clock", format!("{} · running {} · position {} · rate {}×", stats.clock, secs(stats.running_ns), secs(stats.position_ns), stats.rate)),
+            ("stream", self.stream_info.clone().unwrap_or_default()),
+            ("video caps", stats.video_caps.clone().unwrap_or_default()),
+            ("audio caps", stats.audio_caps.clone().unwrap_or_default()),
+            ("video sink", sink(stats.video_sink)),
+            ("audio sink", sink(stats.audio_sink)),
+            ("video queue", queue(stats.video_queue)),
+            ("audio queue", queue(stats.audio_queue)),
+            ("a/v offset", stats.av_offset_ms.map_or("—".to_string(), |ms| format!("{ms:+.1} ms (last video − last audio pts)"))),
+            ("video net", format!("{} · {}", stats.video_net.host, net(&stats.video_net))),
+            ("audio net", format!("{} · {}", stats.audio_net.host, net(&stats.audio_net))),
+            ("last jump", jump),
+        ];
+        Some(
+            div()
+                .flex_none()
+                .p_2()
+                .border_1()
+                .border_color(rgb(TRACK))
+                .font_family("monospace")
+                .text_size(px(11.0))
+                .line_height(px(15.0))
+                .flex()
+                .flex_col()
+                .children(rows.into_iter().map(|(label, value)| {
+                    div()
+                        .flex()
+                        .gap_2()
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .child(div().w(px(90.0)).flex_none().text_color(rgb(FAINT)).child(label))
+                        .child(div().min_w_0().overflow_hidden().text_ellipsis().child(value))
+                })),
+        )
     }
 
     fn playback_error(&self) -> Option<impl IntoElement + use<>> {
@@ -1853,7 +2201,9 @@ const CHANNELS: [&str; 2] = ["Blender", "Blender Studio"];
 
 /// Full sidebar on wide windows; on narrow ones it collapses to an icon rail (like YouTube's
 /// mini guide) instead of disappearing.
-fn sidebar(collapsed: bool, active: &'static str, cx: &mut Context<AppView>) -> impl IntoElement + use<> {
+/// `width` animates between the rail and the full sidebar; the content switches halfway.
+fn sidebar(width: f32, active: &'static str, cx: &mut Context<AppView>) -> impl IntoElement + use<> {
+    let collapsed = width < (RAIL_W + SIDEBAR_W) / 2.0;
     let mut on_home = Some(cx.listener(|this, _: &gpui::ClickEvent, window, cx| this.go_home(window, cx)));
     let mut on_settings = Some(cx.listener(|this, _: &gpui::ClickEvent, window, cx| this.open_settings(window, cx)));
     let nav = move |(kind, label, short): (Icon, &'static str, &'static str)| {
@@ -1918,9 +2268,11 @@ fn sidebar(collapsed: bool, active: &'static str, cx: &mut Context<AppView>) -> 
         .child(play_icon(9.0, rgb(0xffffff).into()));
 
     div()
-        .w(px(if collapsed { RAIL_W } else { SIDEBAR_W }))
+        .w(px(width))
         .flex_none()
         .h_full()
+        .overflow_hidden()
+        .whitespace_nowrap()
         .rounded(px(20.0))
         .bg(rgb(PANEL))
         .when(collapsed, |rail| rail.px_1p5().py_4())
@@ -1958,61 +2310,48 @@ fn sidebar(collapsed: bool, active: &'static str, cx: &mut Context<AppView>) -> 
         })
 }
 
-fn section_heading(title: &'static str, action: &'static str) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .gap_5()
-        .px_2()
-        .child(div().text_lg().font_weight(FontWeight::SEMIBOLD).child(title))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .text_xs()
-                .font_weight(FontWeight::BOLD)
-                .text_color(rgb(MUTED))
-                .child(play_icon(8.0, rgb(MUTED).into()))
-                .child(action),
-        )
-}
-
-fn video_card(ix: usize, video: &'static data::Video, card_w: f32, cx: &mut Context<AppView>) -> impl IntoElement + use<> {
-    let thumb_h = (card_w - 16.0) * 9.0 / 16.0;
+/// Wireframe card: outlined boxes and single-line text, so width changes never re-wrap lines.
+fn wire_card(
+    ix: usize,
+    video: &'static data::Video,
+    x: f32,
+    y: f32,
+    w: f32,
+    highlight: bool,
+    cx: &mut Context<AppView>,
+) -> impl IntoElement + use<> {
+    let line = || div().px_2().whitespace_nowrap().overflow_hidden().text_ellipsis();
     div()
         .id(("card", ix))
-        .w(px(card_w))
-        .p_2()
-        .rounded_xl()
+        .absolute()
+        .left(px(x))
+        .top(px(y))
+        .w(px(w))
+        .h(px(layout::card_h(w)))
+        .overflow_hidden()
+        .border_1()
+        .border_color(rgb(if highlight { ACCENT } else { TRACK }))
         .cursor_pointer()
         .hover(|style| style.bg(rgb(HOVER)))
         .flex()
         .flex_col()
-        .gap_2()
         .on_click(cx.listener(move |this, _, window, cx| this.open_video(video.id.into(), window, cx)))
-        .child(thumbnail(
-            Some(ImageSource::from(video.thumbnail())),
-            Some(video.duration.to_string()),
-            px(card_w - 16.0),
-            px(thumb_h),
-        ))
         .child(
             div()
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .line_height(px(19.0))
-                .line_clamp(2)
-                .text_ellipsis()
-                .child(video.title),
-        )
-        .child(
-            div()
+                .relative()
+                .flex_none()
+                .h(px(layout::thumb_h(w)))
+                .border_b_1()
+                .border_color(rgb(TRACK))
                 .flex()
-                .flex_col()
-                .child(div().text_xs().text_color(rgb(MUTED)).child(video.channel))
-                .child(div().text_xs().text_color(rgb(FAINT)).child(format!("{} · {}", video.views, video.age))),
+                .items_center()
+                .justify_center()
+                .text_color(rgb(FAINT))
+                .child(format!("#{ix}"))
+                .child(div().absolute().bottom_1().right_2().text_xs().child(video.duration)),
         )
+        .child(line().pt_1().text_sm().child(video.title))
+        .child(line().text_xs().text_color(rgb(MUTED)).child(format!("{} · {} · {}", video.channel, video.views, video.age)))
 }
 
 fn thumbnail(source: Option<ImageSource>, duration: Option<String>, w: Pixels, h: Pixels) -> impl IntoElement {

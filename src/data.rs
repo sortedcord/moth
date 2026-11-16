@@ -12,6 +12,7 @@ pub struct Video {
 }
 
 impl Video {
+    #[allow(dead_code)] // Unused while the home grid is wireframed.
     pub fn thumbnail(&self) -> PathBuf {
         PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/thumbs")).join(format!("{}.jpg", self.id))
     }

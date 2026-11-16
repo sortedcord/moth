@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 # gpui is vendored from Zed main (wgpu renderer); see scripts/fetch-vendor.sh for the pinned rev.
-gpui = { path = "vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
+gpui = { path = "vendor/zed/crates/gpui", default-features = false, features = ["wayland", "profiler"] }
 gpui_linux = { path = "vendor/zed/crates/gpui_linux", default-features = false, features = ["wayland"] }
 gstreamer = "0.24"
 gstreamer-video = "0.24"
@@ -19,6 +19,9 @@ reqwest = { version = "0.12", default-features = false, features = ["default-tls
 gstreamer-app = "0.24"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
+async-channel = "2"
+# Same major version (and async-io executor) gpui already pulls in, so no second D-Bus stack.
+zbus = { version = "5.19", default-features = false, features = ["async-io"] }
 
 # Zed patches these crates to its own forks; gpui relies on them.
 [patch.crates-io]
@@ -32,6 +35,12 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# With debug assertions, icu_provider turns its log macros into eprintln!, and gpui's line breaker
+# (which deliberately skips the Thai/Lao/Khmer/Burmese dictionaries) then prints
+# "No segmentation model for complex script" every time such text is laid out: thousands of lines.
+[profile.dev.package.icu_provider]
+debug-assertions = false
 
 [profile.release]
 lto = "thin"

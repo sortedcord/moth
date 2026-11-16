@@ -133,9 +133,65 @@ pub struct Start {
     pub paused: bool,
 }
 
+/// Snapshot of pipeline internals for the debug panel.
+pub struct PlayerStats {
+    pub clock: String,
+    pub state: String,
+    pub position_ns: Option<u64>,
+    /// Pipeline running time (clock time minus base time).
+    pub running_ns: Option<u64>,
+    pub rate: f64,
+    /// Negotiated caps at the video sink, e.g. "1920x1080 @ 24/1 · DMA_DRM NV12".
+    pub video_caps: Option<String>,
+    pub audio_caps: Option<String>,
+    pub video_sink: SinkStats,
+    pub audio_sink: SinkStats,
+    /// Decoded data waiting in front of each sink.
+    pub video_queue: QueueLevel,
+    pub audio_queue: QueueLevel,
+    /// Last rendered video timestamp minus last rendered audio timestamp.
+    pub av_offset_ms: Option<f64>,
+    pub video_net: NetStats,
+    pub audio_net: NetStats,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct SinkStats {
+    pub rendered: u64,
+    pub dropped: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct QueueLevel {
+    pub buffers: u32,
+    pub bytes: u32,
+    pub time_ns: u64,
+}
+
+/// Per-stream download counters, kept by the range source.
+#[derive(Clone, Default)]
+pub struct NetStats {
+    pub host: String,
+    pub bytes: u64,
+    pub requests: u64,
+    /// HTTP 403s (iOS-client URLs refusing to serve far ahead).
+    pub forbidden: u64,
+    /// Throughput of the most recent request, in bytes per second.
+    pub last_rate: f64,
+    pub last_request_ms: u64,
+    /// Bytes queued in the appsrc, not yet demuxed.
+    pub queued: u64,
+    pub fallback: &'static str,
+}
+
 pub struct Player {
     pipeline: gst::Pipeline,
     sink: gst::Element,
+    audio_sink: gst::Element,
+    video_queue: gst::Element,
+    audio_queue: gst::Element,
+    video_src: gst::Element,
+    audio_src: gst::Element,
     rect: Rect,
     paused: bool,
     rate: f64,
@@ -184,6 +240,12 @@ impl Player {
         let aconvert_out = make("audioconvert")?;
         let aresample = make("audioresample")?;
         let asink = make("pipewiresink")?;
+        // pipewiresink's own clock keeps running while the stream is paused and GStreamer doesn't
+        // compensate, so resuming after a pause skipped ahead by the pause length (up to ~5 s,
+        // once WirePlumber suspends the idle device). The monotonic system clock pauses cleanly;
+        // PipeWire resamples the audio to follow it so A/V doesn't drift on long videos.
+        pipeline.use_clock(Some(&gst::SystemClock::obtain()));
+        asink.set_property_from_str("slave-method", "resample");
 
         pipeline.add_many([
             &vsrc, &vdecode, &vqueue, &sink, &asrc, &adecode, &aqueue, &aconvert, &tempo, &aconvert_out,
@@ -216,6 +278,11 @@ impl Player {
         Ok(Self {
             pipeline,
             sink,
+            audio_sink: asink,
+            video_queue: vqueue,
+            audio_queue: aqueue,
+            video_src: vsrc,
+            audio_src: asrc,
             rect,
             paused: start.is_some_and(|start| start.paused),
             rate: start.map_or(1.0, |start| start.rate),
@@ -324,6 +391,28 @@ impl Player {
         self.seek_to(seconds);
     }
 
+    pub fn seek_ns(&self, nanoseconds: u64) {
+        self.seek_clock(gst::ClockTime::from_nseconds(nanoseconds));
+    }
+
+    pub fn position_ns(&self) -> Option<u64> {
+        self.pipeline.query_position::<gst::ClockTime>().map(|t| t.nseconds())
+    }
+
+    /// Decoded (width, height, fps), once caps are negotiated.
+    pub fn video_format(&self) -> Option<(u32, u32, Option<f64>)> {
+        let caps = self.sink.static_pad("sink")?.current_caps()?;
+        let structure = caps.structure(0)?;
+        let width = structure.get::<i32>("width").ok()?;
+        let height = structure.get::<i32>("height").ok()?;
+        let fps = structure
+            .get::<gst::Fraction>("framerate")
+            .ok()
+            .filter(|fps| fps.numer() > 0 && fps.denom() > 0)
+            .map(|fps| f64::from(fps.numer()) / f64::from(fps.denom()));
+        Some((width.max(0) as u32, height.max(0) as u32, fps))
+    }
+
     pub fn drain_events(&self) -> Vec<PlayerEvent> {
         let mut events = Vec::new();
         let Some(bus) = self.pipeline.bus() else { return events };
@@ -353,6 +442,39 @@ impl Player {
         (width > 0 && height > 0).then(|| width as f32 * par / height as f32)
     }
 
+    pub fn stats(&self) -> PlayerStats {
+        let clock = self.pipeline.clock();
+        let running_ns = clock.as_ref().and_then(|clock| {
+            let now = clock.time();
+            let base = self.pipeline.base_time()?;
+            Some(now.nseconds().saturating_sub(base.nseconds()))
+        });
+        let (_, current, pending) = self.pipeline.state(gst::ClockTime::ZERO);
+        let state = if pending == gst::State::VoidPending {
+            format!("{current:?}")
+        } else {
+            format!("{current:?} → {pending:?}")
+        };
+        let video_ts = last_sample_pts(&self.sink);
+        let audio_ts = last_sample_pts(&self.audio_sink);
+        PlayerStats {
+            clock: clock.map_or_else(|| "none".to_string(), |clock| clock.name().to_string()),
+            state,
+            position_ns: self.pipeline.query_position::<gst::ClockTime>().map(|t| t.nseconds()),
+            running_ns,
+            rate: self.rate,
+            video_caps: pad_caps(&self.sink),
+            audio_caps: pad_caps(&self.audio_sink),
+            video_sink: sink_stats(&self.sink),
+            audio_sink: sink_stats(&self.audio_sink),
+            video_queue: queue_level(&self.video_queue),
+            audio_queue: queue_level(&self.audio_queue),
+            av_offset_ms: video_ts.zip(audio_ts).map(|(v, a)| (v as f64 - a as f64) / 1e6),
+            video_net: net_stats(&self.video_source, &self.video_src),
+            audio_net: net_stats(&self.audio_source, &self.audio_src),
+        }
+    }
+
     /// Name of the video decoder that decodebin picked (e.g. `vavp9dec` = VA-API hardware).
     pub fn video_decoder(&self) -> Option<String> {
         self.pipeline.iterate_recurse().into_iter().flatten().find_map(|el| {
@@ -361,6 +483,69 @@ impl Player {
             (klass.contains("Decoder") && klass.contains("Video")).then(|| factory.name().to_string())
         })
     }
+}
+
+fn sink_stats(sink: &gst::Element) -> SinkStats {
+    let stats = sink.property::<gst::Structure>("stats");
+    SinkStats {
+        rendered: stats.get("rendered").unwrap_or(0),
+        dropped: stats.get("dropped").unwrap_or(0),
+    }
+}
+
+fn queue_level(queue: &gst::Element) -> QueueLevel {
+    QueueLevel {
+        buffers: queue.property("current-level-buffers"),
+        bytes: queue.property("current-level-bytes"),
+        time_ns: queue.property("current-level-time"),
+    }
+}
+
+fn last_sample_pts(sink: &gst::Element) -> Option<u64> {
+    let sample = sink.property::<Option<gst::Sample>>("last-sample")?;
+    Some(sample.buffer()?.pts()?.nseconds())
+}
+
+/// e.g. "1920x1080 @ 24/1 · NV12 (memory:DMABuf)" or "48000 Hz · 2 ch · F32LE".
+fn pad_caps(sink: &gst::Element) -> Option<String> {
+    let caps = sink.static_pad("sink")?.current_caps()?;
+    let structure = caps.structure(0)?;
+    let mut parts = Vec::new();
+    if let (Ok(w), Ok(h)) = (structure.get::<i32>("width"), structure.get::<i32>("height")) {
+        let fps = structure.get::<gst::Fraction>("framerate").map(|f| format!(" @ {}/{}", f.numer(), f.denom()));
+        parts.push(format!("{w}x{h}{}", fps.unwrap_or_default()));
+    }
+    if let Ok(rate) = structure.get::<i32>("rate") {
+        parts.push(format!("{rate} Hz"));
+    }
+    if let Ok(channels) = structure.get::<i32>("channels") {
+        parts.push(format!("{channels} ch"));
+    }
+    let format = structure.get::<&str>("drm-format").or_else(|_| structure.get::<&str>("format"));
+    if let Ok(format) = format {
+        parts.push(format.to_string());
+    }
+    if let Some(features) = caps.features(0).filter(|features| !features.is_any() && features.size() > 0) {
+        parts.push(format!("({features})"));
+    }
+    Some(parts.join(" · "))
+}
+
+fn net_stats(source: &Mutex<Source>, appsrc: &gst::Element) -> NetStats {
+    let source = lock(source);
+    let mut stats = source.net.clone();
+    stats.host = reqwest::Url::parse(&source.url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_default();
+    stats.queued = appsrc.property("current-level-bytes");
+    stats.fallback = match (&source.fallback, source.switched) {
+        (_, true) => "switched",
+        (Fallback::Pending, _) => "resolving",
+        (Fallback::Ready(_), _) => "ready",
+        (Fallback::Unavailable, _) => "none",
+    };
+    stats
 }
 
 impl Drop for Player {
@@ -393,12 +578,13 @@ struct Source {
     url: String,
     fallback: Fallback,
     switched: bool,
+    net: NetStats,
 }
 
 impl Source {
     fn new(url: String, fallback_pending: bool) -> Arc<Mutex<Self>> {
         let fallback = if fallback_pending { Fallback::Pending } else { Fallback::Unavailable };
-        Arc::new(Mutex::new(Self { url, fallback, switched: false }))
+        Arc::new(Mutex::new(Self { url, fallback, switched: false, net: NetStats::default() }))
     }
 }
 
@@ -497,7 +683,23 @@ fn feed(
     let waiting_since = std::time::Instant::now();
     let bytes = loop {
         let url = lock(source).url.clone();
-        match http.runtime.block_on(fetch_range(&http.client, &url, start, end))? {
+        let requested_at = std::time::Instant::now();
+        let fetched = http.runtime.block_on(fetch_range(&http.client, &url, start, end))?;
+        {
+            let elapsed = requested_at.elapsed();
+            let net = &mut lock(source).net;
+            net.requests += 1;
+            net.last_request_ms = elapsed.as_millis() as u64;
+            match &fetched {
+                Fetched::Data(bytes) => {
+                    net.bytes += bytes.len() as u64;
+                    net.last_rate = bytes.len() as f64 / elapsed.as_secs_f64().max(1e-6);
+                }
+                Fetched::Forbidden => net.forbidden += 1,
+                Fetched::PastEnd => {}
+            }
+        }
+        match fetched {
             Fetched::Data(bytes) => break bytes,
             Fetched::PastEnd => {
                 mark_eos(state, epoch, appsrc);
