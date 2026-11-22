@@ -112,13 +112,14 @@ bars. Without a running moth it prints `{"running":false,…}`; `--watch` then w
           "thumbnail":"https://i.ytimg.com/vi/aqz-KE-bpKQ/hqdefault.jpg"},
  "position":12.78,"duration":634.0,"rate":1.0,
  "stream":{"width":1280,"height":720,"fps":60.0,"quality":"720p60","quality_auto":true,
-           "video_codec":"VP9","audio_codec":"Opus","decoder":"vavp9dec","resolver":"rustypipe",
+           "video_codec":"VP9","audio_codec":"Opus","audio_track":null,"decoder":"vavp9dec","resolver":"rustypipe",
            "fallback_urls":false,"video_suspended":false},
  "fullscreen":false}
 ```
 
 `status` is one of `idle`, `resolving`, `buffering`, `playing`, `paused`, `ended`, `error`; `page` is `home`, `watch`
-or `settings`. `video_suspended` is true while video is off because the window is out of sight. Title and channel are `null` until the watch page has loaded. Under the hood this is the
+or `settings`. `video_suspended` is true while video is off because the window is out of sight. `audio_track` names the audio track
+(e.g. `"German"`) for videos with several, such as dubs. Title and channel are `null` until the watch page has loaded. Under the hood this is the
 `$XDG_RUNTIME_DIR/moth.sock` socket: send the line `status` or `watch` (a URL line opens that video).
 
 moth is also an **MPRIS** player (`org.mpris.MediaPlayer2.moth`), so media keys, desktop shells and `playerctl`

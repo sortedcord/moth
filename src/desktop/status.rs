@@ -71,6 +71,8 @@ pub struct StreamInfo {
     pub quality_auto: bool,
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
+    /// The audio track's name (e.g. "German"), for videos with several (dubs).
+    pub audio_track: Option<String>,
     /// GStreamer decoder element, e.g. "vavp9dec" (VA-API hardware).
     pub decoder: Option<String>,
     /// What found the streams, e.g. "rustypipe" or "yt-dlp".

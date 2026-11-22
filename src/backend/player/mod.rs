@@ -357,6 +357,12 @@ impl Player {
         self.paused
     }
 
+    /// The pipeline has started and reached the [`Start`] position: the frame there is up (in
+    /// the video sink, even while paused), and the audio after it is ready to play.
+    pub fn start_landed(&self) -> bool {
+        self.started && self.pending_position.is_none() && !self.unmute_on_async_done
+    }
+
     pub fn position(&self) -> Option<Duration> {
         self.pipeline.query_position::<gst::ClockTime>().map(Duration::from)
     }

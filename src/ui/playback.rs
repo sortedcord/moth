@@ -28,6 +28,14 @@ const TICK: Duration = Duration::from_millis(250);
 /// How long the window has to stay out of sight before video is suspended: switching workspaces
 /// past it, or a moment behind another window, shouldn't cost a catch-up.
 const SUSPEND_AFTER: Duration = Duration::from_secs(1);
+/// Switching streams, the new player starts this far (in playback time) ahead of the current
+/// position, and takes over there; it's usually ready well before.
+const HANDOVER_LEAD: Duration = Duration::from_millis(1500);
+/// How long the replaced player's last frame stays up under the new one's first, so the
+/// picture never drops out between them.
+const RETIRE_AFTER: Duration = Duration::from_millis(250);
+/// Close enough to the handover position to take over.
+const TOLERANCE: Duration = Duration::from_millis(30);
 /// Playback moving this much more or less than the clock says counts as a jump.
 const JUMP_THRESHOLD_SECONDS: f64 = 0.5;
 
@@ -77,6 +85,14 @@ impl VideoAnchor {
         *self.overlay.borrow_mut() = Some(overlay);
     }
 
+    /// Show another player's video in place of the current one's.
+    fn replace(&self, overlay: VideoOverlay) {
+        if let Some(rect) = self.rect.get() {
+            overlay.set_rect(rect);
+        }
+        *self.overlay.borrow_mut() = Some(overlay);
+    }
+
     fn detach(&self) {
         self.overlay.borrow_mut().take();
         self.rect.set(None);
@@ -110,6 +126,19 @@ impl JumpDetector {
     }
 }
 
+/// A player for other streams, getting ready to take over from the current one at `at` (see
+/// [`PlaybackSession::switch_to`]). It's paused there, its video out of sight.
+struct Handover {
+    player: Player,
+    generation: u64,
+    selection: Selection,
+    at: Duration,
+    /// The current player reached `at` first and was paused there to wait.
+    stalled: bool,
+    _events: Task<()>,
+    _due: Option<Task<()>>,
+}
+
 pub struct PlaybackSession {
     backend: Arc<Backend>,
     target: Result<WaylandTarget, String>,
@@ -121,6 +150,12 @@ pub struct PlaybackSession {
     quality_auto: bool,
     rate: f64,
     player: Option<Player>,
+    /// Tells the current player's events from the handover's.
+    generation: u64,
+    next_generation: u64,
+    handover: Option<Handover>,
+    /// The player just replaced, kept (paused) for a moment; see [`RETIRE_AFTER`].
+    retiring: Option<(Player, Task<()>)>,
     position: Option<Duration>,
     duration: Option<Duration>,
     decoder: Option<String>,
@@ -153,6 +188,10 @@ impl PlaybackSession {
             quality_auto: true,
             rate: settings.default_rate,
             player: None,
+            generation: 0,
+            next_generation: 0,
+            handover: None,
+            retiring: None,
             position: None,
             duration: None,
             decoder: None,
@@ -262,6 +301,7 @@ impl PlaybackSession {
             quality_auto: self.quality_auto,
             video_codec: video.map(|video| video.codec.to_string()),
             audio_codec: self.audio_stream().map(|audio| audio.codec.to_string()),
+            audio_track: self.audio_stream().and_then(|audio| audio.track.as_ref()).map(|track| track.name.clone()),
             decoder: self.decoder.clone(),
             resolver: catalog.resolver,
             fallback_urls: self.using_alternates(),
@@ -392,22 +432,35 @@ impl PlaybackSession {
     }
 
     fn set_paused(&mut self, paused: bool, cx: &mut Context<Self>) {
-        let Some(player) = self.player.as_mut() else { return };
-        player.set_paused(paused);
-        self.status = if paused { Status::Paused } else { Status::Playing };
-        cx.notify();
+        self.controlling(cx, |this| {
+            let Some(player) = this.player.as_mut() else { return };
+            player.set_paused(paused);
+            this.status = if paused { Status::Paused } else { Status::Playing };
+        });
     }
 
     fn restart(&mut self, cx: &mut Context<Self>) {
-        let Some(player) = self.player.as_mut() else { return };
-        player.seek(Duration::ZERO);
-        player.set_paused(false);
-        self.status = Status::Playing;
+        self.controlling(cx, |this| {
+            let Some(player) = this.player.as_mut() else { return };
+            player.seek(Duration::ZERO);
+            player.set_paused(false);
+            this.status = Status::Playing;
+        });
+    }
+
+    /// Apply a pause, seek or rate change. A handover in progress was planned for the old state,
+    /// so it starts over from the new one.
+    fn controlling(&mut self, cx: &mut Context<Self>, control: impl FnOnce(&mut Self)) {
+        let switching_to = self.cancel_handover();
+        control(self);
+        if let Some(selection) = switching_to {
+            self.switch_to(selection, cx);
+        }
         cx.notify();
     }
 
     pub fn seek(&mut self, seek: Seek, cx: &mut Context<Self>) {
-        let Some(player) = self.player.as_mut() else { return };
+        let Some(player) = self.player.as_ref() else { return };
         let target = match seek {
             Seek::By(seconds) => {
                 let Some(position) = self.position.or_else(|| player.position()) else { return };
@@ -417,9 +470,11 @@ impl PlaybackSession {
             Seek::To(target) if self.duration.is_some_and(|duration| target > duration) => return,
             Seek::To(target) => target,
         };
-        player.seek(target);
-        self.position = Some(target);
-        cx.notify();
+        self.controlling(cx, |this| {
+            let Some(player) = this.player.as_mut() else { return };
+            player.seek(target);
+            this.position = Some(target);
+        });
     }
 
     /// Seek to a fraction (0–1) of the video.
@@ -430,11 +485,12 @@ impl PlaybackSession {
     }
 
     pub fn set_rate(&mut self, rate: f64, cx: &mut Context<Self>) {
-        self.rate = rate;
-        if let Some(player) = self.player.as_mut() {
-            player.set_rate(rate);
-        }
-        cx.notify();
+        self.controlling(cx, |this| {
+            this.rate = rate;
+            if let Some(player) = this.player.as_mut() {
+                player.set_rate(rate);
+            }
+        });
     }
 
     /// `None` = automatic. Keeps the current codec where the quality has it.
@@ -479,17 +535,126 @@ impl PlaybackSession {
         }
     }
 
-    /// Rebuild playback with other streams, resuming where we are.
+    /// Play other streams from where we are. While playing or paused this is seamless: a second
+    /// player starts on the new streams a little ahead, out of sight, and takes over when the
+    /// current one gets there, so neither the picture nor the sound drops out.
     fn switch_to(&mut self, selection: Selection, cx: &mut Context<Self>) {
+        if self.handover.as_ref().is_some_and(|handover| handover.selection == selection) {
+            return;
+        }
+        self.cancel_handover();
         if self.selection == Some(selection) {
             return;
         }
-        let start = Start {
-            position: self.position.unwrap_or_default(),
-            rate: self.rate,
-            paused: self.status == Status::Paused,
+        let paused = self.status == Status::Paused;
+        // The session's position: right after a seek, the player may still report the old one.
+        let position = self.position.or_else(|| self.player.as_ref().and_then(Player::position)).unwrap_or_default();
+        let at = if paused { position } else { position + HANDOVER_LEAD.mul_f64(self.rate) };
+        let seamless = matches!(self.status, Status::Playing | Status::Paused)
+            && self.duration.is_some_and(|duration| at < duration);
+        if !seamless {
+            return self.play_selection(selection, Some(Start { position, rate: self.rate, paused }), cx);
+        }
+        let start = Start { position: at, rate: self.rate, paused: true };
+        match self.new_player(selection, start, cx) {
+            Ok((player, generation, events)) => {
+                self.handover =
+                    Some(Handover { player, generation, selection, at, stalled: false, _events: events, _due: None });
+                self.arm_handover(cx);
+            }
+            Err(err) => {
+                eprintln!("moth: couldn't prepare the new streams ({err}); restarting playback with them");
+                self.play_selection(selection, Some(Start { position, rate: self.rate, paused }), cx);
+            }
+        }
+    }
+
+    /// Check on the handover when the current player should have reached its position.
+    fn arm_handover(&mut self, cx: &mut Context<Self>) {
+        let position = self.player.as_ref().and_then(Player::position);
+        let rate = self.rate.max(0.01);
+        let Some(handover) = self.handover.as_mut() else { return };
+        let delay = match position {
+            Some(position) if self.status == Status::Playing => handover.at.saturating_sub(position).div_f64(rate),
+            _ => Duration::ZERO,
         };
-        self.play_selection(selection, Some(start), cx);
+        handover._due = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            this.update(cx, |this, cx| this.handover_due(cx)).ok();
+        }));
+    }
+
+    /// The current player is at the handover position: hand over if the new one is ready, else
+    /// hold the current one there until it is.
+    fn handover_due(&mut self, cx: &mut Context<Self>) {
+        let playing = self.status == Status::Playing;
+        let position = self.player.as_ref().and_then(Player::position);
+        let Some(handover) = self.handover.as_mut() else { return };
+        if playing && !handover.stalled && position.is_some_and(|position| position + TOLERANCE < handover.at) {
+            // Not there yet: it was buffering, or the clock drifted.
+            return self.arm_handover(cx);
+        }
+        if handover.player.start_landed() {
+            return self.complete_handover(cx);
+        }
+        if playing && !handover.stalled {
+            handover.stalled = true;
+            if let Some(player) = self.player.as_mut() {
+                player.set_paused(true);
+            }
+        }
+    }
+
+    fn on_handover_event(&mut self, event: PlayerEvent, cx: &mut Context<Self>) {
+        let Some(handover) = self.handover.as_mut() else { return };
+        handover.player.handle(&event);
+        if let PlayerEvent::Error(err) = event {
+            let selection = handover.selection;
+            self.cancel_handover();
+            eprintln!("moth: couldn't prepare the new streams ({err}); restarting playback with them");
+            let start = Start {
+                position: self.position.unwrap_or_default(),
+                rate: self.rate,
+                paused: self.status == Status::Paused,
+            };
+            return self.play_selection(selection, Some(start), cx);
+        }
+        // Ready early: wait for the due check, unless the current player is already waiting.
+        let waiting = handover.stalled || self.status != Status::Playing;
+        if waiting && handover.player.start_landed() {
+            self.complete_handover(cx);
+        }
+    }
+
+    fn complete_handover(&mut self, cx: &mut Context<Self>) {
+        let Some(Handover { mut player, generation, selection, _events, .. }) = self.handover.take() else { return };
+        if let Some(mut previous) = self.player.take() {
+            previous.set_paused(true);
+            let retire = cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(RETIRE_AFTER).await;
+                this.update(cx, |this, _| this.retiring = None).ok();
+            });
+            self.retiring = Some((previous, retire));
+        }
+        if self.status == Status::Playing {
+            player.set_paused(false);
+        }
+        self.anchor.replace(player.overlay());
+        self.install(player, generation, _events, selection, cx);
+        cx.notify();
+    }
+
+    /// Drop a handover in progress, letting the current player carry on. Returns the streams it
+    /// was switching to.
+    fn cancel_handover(&mut self) -> Option<Selection> {
+        let handover = self.handover.take()?;
+        if handover.stalled
+            && self.status == Status::Playing
+            && let Some(player) = self.player.as_mut()
+        {
+            player.set_paused(false);
+        }
+        Some(handover.selection)
     }
 
     // ── Internals ────────────────────────────────────────────────────────────
@@ -500,6 +665,8 @@ impl PlaybackSession {
     }
 
     fn stop_player(&mut self) {
+        self.handover = None;
+        self.retiring = None;
         self._events = None;
         self._tick = None;
         self._alternates = None;
@@ -509,54 +676,92 @@ impl PlaybackSession {
     }
 
     fn play_selection(&mut self, selection: Selection, start: Option<Start>, cx: &mut Context<Self>) {
-        let (Some(video), Some(catalog)) = (self.video.clone(), self.catalog.clone()) else { return };
         self.stop_player();
+        let (player, generation, events) = match self.new_player_at(selection, start, self.anchor.rect(), cx) {
+            Ok(created) => created,
+            Err(err) => return self.fail(err, cx),
+        };
+        self.anchor.attach(player.overlay());
+        self.status = Status::Buffering;
+        self.install(player, generation, events, selection, cx);
+        cx.notify();
+    }
+
+    /// A player for `selection`, out of sight, with its events routed back here.
+    fn new_player(
+        &mut self,
+        selection: Selection,
+        start: Start,
+        cx: &mut Context<Self>,
+    ) -> Result<(Player, u64, Task<()>), String> {
+        self.new_player_at(selection, Some(start), Rect::HIDDEN, cx)
+    }
+
+    fn new_player_at(
+        &mut self,
+        selection: Selection,
+        start: Option<Start>,
+        rect: Rect,
+        cx: &mut Context<Self>,
+    ) -> Result<(Player, u64, Task<()>), String> {
+        let catalog = self.catalog.clone().ok_or("no streams")?;
+        let alternates_pending = cx.global::<Settings>().seek_fallback && catalog.has_alternates;
+        let input = PlayerInput::new(&catalog, selection, alternates_pending)
+            .ok_or("the selected streams aren't in the catalog")?;
+        let target = self.target.clone()?;
+        let (player, mut events) =
+            Player::new(&input, start, &target, rect, &self.backend.http()).map_err(|err| format!("{err:#}"))?;
+        self.next_generation += 1;
+        let generation = self.next_generation;
+        let events = cx.spawn(async move |this, cx| {
+            while let Some(event) = events.next().await {
+                if this.update(cx, |this, cx| this.on_player_event(generation, event, cx)).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok((player, generation, events))
+    }
+
+    /// Make `player` the current one (dropping any other), playing `selection`.
+    fn install(
+        &mut self,
+        player: Player,
+        generation: u64,
+        events: Task<()>,
+        selection: Selection,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(video), Some(catalog)) = (self.video.clone(), self.catalog.clone()) else { return };
         self.selection = Some(selection);
         self.decoder = None;
         self.format = None;
         self.jumps.previous = None;
+        self.video_suspended = false;
         if let Some(stream) = catalog.video_stream(selection.video)
             && stream.width > 0
             && stream.height > 0
         {
             self.aspect = Some(stream.width as f32 / stream.height as f32);
         }
-
-        let alternates = cx
-            .global::<Settings>()
-            .seek_fallback
-            .then(|| self.backend.alternate_urls(&video, &catalog, selection))
-            .flatten();
-        let Some(input) = PlayerInput::new(&catalog, selection, alternates.is_some()) else {
-            return self.fail("the selected streams aren't in the catalog".into(), cx);
-        };
-        let target = match &self.target {
-            Ok(target) => *target,
-            Err(err) => return self.fail(err.clone(), cx),
-        };
-        let (player, mut events) = match Player::new(&input, start, &target, self.anchor.rect(), &self.backend.http()) {
-            Ok(created) => created,
-            Err(err) => return self.fail(format!("{err:#}"), cx),
-        };
-        self.anchor.attach(player.overlay());
+        let alternates_pending = cx.global::<Settings>().seek_fallback && catalog.has_alternates;
+        let alternates = alternates_pending.then(|| self.backend.alternate_urls(&video, &catalog, selection)).flatten();
+        if alternates_pending && alternates.is_none() {
+            player.alternates_failed();
+        }
         self.player = Some(player);
-        self.status = Status::Buffering;
-
-        self._events = Some(cx.spawn(async move |this, cx| {
-            while let Some(event) = events.next().await {
-                if this.update(cx, |this, cx| this.on_player_event(event, cx)).is_err() {
-                    break;
+        self.generation = generation;
+        self._events = Some(events);
+        if self._tick.is_none() {
+            self._tick = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(TICK).await;
+                    if this.update(cx, |this, cx| this.tick(cx)).is_err() {
+                        break;
+                    }
                 }
-            }
-        }));
-        self._tick = Some(cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(TICK).await;
-                if this.update(cx, |this, cx| this.tick(cx)).is_err() {
-                    break;
-                }
-            }
-        }));
+            }));
+        }
         self._alternates = alternates.map(|alternates| {
             cx.spawn(async move |this, cx| {
                 let result = alternates.await;
@@ -573,12 +778,21 @@ impl PlaybackSession {
                 .ok();
             })
         });
-        cx.notify();
     }
 
-    fn on_player_event(&mut self, event: PlayerEvent, cx: &mut Context<Self>) {
+    fn on_player_event(&mut self, generation: u64, event: PlayerEvent, cx: &mut Context<Self>) {
+        if self.handover.as_ref().is_some_and(|handover| handover.generation == generation) {
+            return self.on_handover_event(event, cx);
+        }
+        if generation != self.generation {
+            return;
+        }
         let Some(player) = self.player.as_mut() else { return };
         player.handle(&event);
+        if event == PlayerEvent::Paused && self.handover.as_ref().is_some_and(|handover| handover.stalled) {
+            // Held for the handover, not paused by anyone.
+            return;
+        }
         let paused = player.is_paused();
         self.status = match event {
             PlayerEvent::Error(err) => Status::Error(err),
