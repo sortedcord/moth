@@ -6,7 +6,6 @@
 mod local;
 pub mod media;
 pub mod player;
-pub mod samples;
 pub mod selection;
 pub mod source;
 mod youtube;
@@ -130,11 +129,31 @@ impl Backend {
         Some(self.run(future))
     }
 
-    /// The home page: each source's featured videos (local dev videos first), then the samples.
-    pub fn home_feed(&self) -> Vec<VideoSummary> {
-        let mut feed: Vec<_> = self.sources.iter().rev().flat_map(|source| source.featured()).collect();
-        feed.extend(samples::home_feed());
-        feed
+    /// Videos for the home page that are known right away: each source's featured ones (local
+    /// dev videos first).
+    pub fn featured(&self) -> Vec<VideoSummary> {
+        self.sources.iter().rev().flat_map(|source| source.featured()).collect()
+    }
+
+    /// The sites' recommendations for the home page, one after another. Fails only if every
+    /// site that has recommendations fails.
+    pub fn recommendations(&self) -> impl Future<Output = Result<Vec<VideoSummary>>> + use<> {
+        let feeds: Vec<_> =
+            self.sources.iter().filter_map(|source| Some((source.name(), source.recommendations()?))).collect();
+        self.run(async move {
+            let mut videos = Vec::new();
+            let mut errors = Vec::new();
+            for (name, feed) in feeds {
+                match feed.await {
+                    Ok(feed) => videos.extend(feed),
+                    Err(err) => errors.push(format!("{name}: {err:#}")),
+                }
+            }
+            if videos.is_empty() && !errors.is_empty() {
+                bail!("{}", errors.join("\n"));
+            }
+            Ok(videos)
+        })
     }
 
     pub fn web_url(&self, video: &VideoRef) -> Option<String> {

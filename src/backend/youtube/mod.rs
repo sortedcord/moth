@@ -220,6 +220,11 @@ impl VideoSource for YouTube {
         }))
     }
 
+    fn recommendations(&self) -> Option<BoxFuture<Vec<VideoSummary>>> {
+        let (http, client) = (self.http.clone(), self.client.clone());
+        Some(Box::pin(async move { visionos::home(&http, &client).await }))
+    }
+
     fn web_url(&self, id: &str) -> String {
         format!("https://www.youtube.com/watch?v={id}")
     }

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 pub struct DevOptions {
     /// `MOTH_OPEN=<home card index | URL | video ID>`: open a video at startup.
     pub open: Option<String>,
-    /// `MOTH_CARDS=<n>`: fill the home grid with n cards (cycling the samples).
+    /// `MOTH_CARDS=<n>`: fill the home grid with n cards (cycling the feed).
     pub cards: Option<usize>,
     /// `MOTH_FRAME_STATS=1`: show gpui's frame-time overlay from the start.
     pub frame_stats: bool,

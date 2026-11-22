@@ -7,9 +7,9 @@ hardware by GStreamer and handed straight to the Wayland compositor. It uses a f
 power of watching in a browser tab, and it fits into the desktop: media keys, MPRIS, a status CLI for bars and
 a browser extension that sends YouTube links to it.
 
-> **Status:** early and under active development. Watching videos works well; the home page is a placeholder
-> (a wireframe grid of sample videos) while the layout is being designed, and there are no accounts,
-> subscriptions or search yet. Linux + Wayland only.
+> **Status:** early and under active development. Watching videos works well; the home page shows YouTube's
+> signed-out recommendations (popular videos for your region), and there are no accounts, subscriptions or
+> search yet. Linux + Wayland only.
 
 ## Features
 
@@ -195,10 +195,6 @@ moth is built on the work of many projects:
   [Serde](https://serde.rs) (MIT/Apache-2.0) and the rest of the Rust crates in `Cargo.lock`.
 - [Outfit](https://github.com/Outfitio/Outfit-Fonts) by the Outfit Project Authors (SIL Open Font License 1.1):
   the UI font, bundled in `assets/fonts/` with its license.
-- The sample videos on the home page are [Blender Studio](https://studio.blender.org/films/)'s open movies
-  (Big Buck Bunny, Sintel, Tears of Steel, Cosmos Laundromat, Agent 327, Spring and CHARGE), released under
-  Creative Commons Attribution licenses by the Blender Foundation / Blender Studio; their thumbnails are in
-  `assets/thumbs/`.
 
 moth is an independent project, not affiliated with or endorsed by YouTube or Google.
 

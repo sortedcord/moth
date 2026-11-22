@@ -52,9 +52,14 @@ pub trait VideoSource: Send + Sync {
         None
     }
 
-    /// Videos to put on the home page.
+    /// Videos to put on the home page right away (known without asking a server).
     fn featured(&self) -> Vec<VideoSummary> {
         Vec::new()
+    }
+
+    /// The site's recommendations for the home page, if it has any.
+    fn recommendations(&self) -> Option<BoxFuture<Vec<VideoSummary>>> {
+        None
     }
 }
 

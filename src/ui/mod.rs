@@ -112,6 +112,12 @@ fn wayland_target(window: &Window) -> Result<WaylandTarget, String> {
     Ok(unsafe { WaylandTarget::new(display, surface) })
 }
 
+pub enum FeedStatus {
+    Loading,
+    Loaded,
+    Failed(SharedString),
+}
+
 enum Route {
     Home,
     Watch(Entity<WatchPage>),
@@ -127,6 +133,10 @@ pub struct AppView {
     settings_error: Option<SharedString>,
     layout: HomeLayout,
     feed: Vec<VideoSummary>,
+    /// Recommendations still loading, or why they failed.
+    feed_status: FeedStatus,
+    /// `MOTH_OPEN=<card index>` past the cards known at startup: opened once the feed is in.
+    open_card: Option<usize>,
     focus: FocusHandle,
     hub: Arc<Hub>,
     /// Whether gpui says the window is visible, and whether its frames are being shown (see
@@ -135,6 +145,7 @@ pub struct AppView {
     frames_shown: bool,
     _presence: Option<Task<()>>,
     _resolve: Option<Task<()>>,
+    _feed: Option<Task<()>>,
     _page_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
     _commands: Task<()>,
@@ -154,7 +165,7 @@ impl AppView {
         if dev.frame_stats {
             window.set_debug_frame_overlay_mode(gpui::DebugFrameOverlayMode::Full);
         }
-        let feed = cx.global::<BackendHandle>().0.home_feed();
+        let feed = cx.global::<BackendHandle>().0.featured();
         let target = wayland_target(window);
         let session = cx.new(|cx| PlaybackSession::new(target, cx));
         let address = cx.new(|cx| {
@@ -200,28 +211,64 @@ impl AppView {
             settings_error: None,
             layout: HomeLayout::new(dev.cards.unwrap_or(feed.len())),
             feed,
+            feed_status: FeedStatus::Loading,
+            open_card: None,
             focus,
             hub,
             platform_shown: window.visibility().is_visible(),
             frames_shown: true,
             _presence: None,
             _resolve: None,
+            _feed: None,
             _page_subscriptions: Vec::new(),
             _subscriptions: subscriptions,
             _commands: commands,
         };
+        cx.observe(&view.images, |_, _, cx| cx.notify()).detach();
+        view.load_feed(window, cx);
         if let Some(link) = open {
             view.submit_address(link, window, cx);
         } else if let Some(target) = dev.open {
             match target.parse::<usize>() {
-                Ok(ix) if !view.feed.is_empty() => {
-                    let video = view.feed[ix.min(view.feed.len() - 1)].video.clone();
-                    view.open_video(video, window, cx);
-                }
+                Ok(ix) if ix < view.feed.len() => view.open_video(view.feed[ix].video.clone(), window, cx),
+                Ok(ix) => view.open_card = Some(ix),
                 _ => view.submit_address(target, window, cx),
             }
         }
         view
+    }
+
+    /// Fetch the home page's recommendations (after the featured videos already there).
+    fn load_feed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.feed_status = FeedStatus::Loading;
+        let recommendations = cx.global::<BackendHandle>().0.recommendations();
+        self._feed = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = recommendations.await;
+            this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(videos) => {
+                        this.feed.extend(videos);
+                        this.feed_status = FeedStatus::Loaded;
+                    }
+                    Err(err) => {
+                        eprintln!("moth: no recommendations: {err:#}");
+                        this.feed_status = FeedStatus::Failed(format!("{err:#}").into());
+                    }
+                }
+                // Featured videos' thumbnails too (the image cache skips what it has).
+                let urls: Vec<String> = this.feed.iter().filter_map(|video| video.thumbnail_url.clone()).collect();
+                this.images.update(cx, |images, cx| urls.into_iter().for_each(|url| images.load(url, cx)));
+                let count = cx.global::<DevOptions>().cards.unwrap_or(this.feed.len());
+                this.layout.set_count(count);
+                if let Some(ix) = this.open_card.take()
+                    && let Some(video) = this.feed.get(ix.min(this.feed.len().saturating_sub(1)))
+                {
+                    this.open_video(video.video.clone(), window, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     // ── Navigation ───────────────────────────────────────────────────────────
@@ -523,7 +570,8 @@ impl Render for AppView {
                     }
                     _ => (
                         sidebar::Entry::Home,
-                        home::render(&self.layout, &self.feed, viewport_h, cx).into_any_element(),
+                        home::render(&self.layout, &self.feed, &self.feed_status, &self.images, viewport_h, cx)
+                            .into_any_element(),
                     ),
                 };
                 div()

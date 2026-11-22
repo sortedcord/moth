@@ -130,6 +130,8 @@ pub struct HomeLayout {
     pub scroll: ScrollHandle,
     last_tick: Option<Instant>,
     initialized: bool,
+    /// Cards from this index on are new: they appear in place instead of flying in.
+    fresh_from: Option<usize>,
     /// Debug: the step used for the last frame, and how many springs were still moving.
     pub dt: f32,
     pub moving: usize,
@@ -148,10 +150,20 @@ impl HomeLayout {
             scroll: ScrollHandle::new(),
             last_tick: None,
             initialized: false,
+            fresh_from: None,
             dt: 0.0,
             moving: 0,
             show_targets: false,
             slow_motion: false,
+        }
+    }
+
+    /// Change how many cards there are (e.g. once the feed arrives).
+    pub fn set_count(&mut self, count: usize) {
+        let old = self.cards.len();
+        self.cards.resize(count, CardMotion::default());
+        if count > old {
+            self.fresh_from = Some(self.fresh_from.map_or(old, |fresh| fresh.min(old)));
         }
     }
 
@@ -177,9 +189,10 @@ impl HomeLayout {
 
         // The grid follows the sidebar as it animates, so the content width is continuous too.
         self.spec = GridSpec::for_width(main_width(viewport_w, self.sidebar_w.value()));
+        let fresh_from = self.fresh_from.take().unwrap_or(usize::MAX);
         for (ix, card) in self.cards.iter_mut().enumerate() {
             let (x, y) = self.spec.slot(ix);
-            if snap {
+            if snap || ix >= fresh_from {
                 card.x.snap(x);
                 card.y.snap(y);
                 card.w.snap(self.spec.card_w);

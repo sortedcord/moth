@@ -7,16 +7,20 @@
 //!
 //! The request needs a visitor ID (`visitorData`); without one YouTube asks to sign in. RustyPipe
 //! keeps a cache of them, and a refused one is dropped and replaced once.
+//!
+//! Signed out, this client also still has a home feed (popular videos for the region YouTube
+//! places the visitor in), where the web client's is empty until there's watch history.
 
 use anyhow::{Context as _, Result, bail};
 use rustypipe::client::RustyPipe;
 use serde::Deserialize;
 
 use crate::backend::media::{
-    AudioCodec, AudioStream, AudioTrack, Location, StreamCatalog, StreamId, VideoCodec, VideoStream,
+    AudioCodec, AudioStream, AudioTrack, Location, StreamCatalog, StreamId, VideoCodec, VideoRef, VideoStream,
+    VideoSummary,
 };
 
-const PLAYER_URL: &str = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
+const API_URL: &str = "https://www.youtube.com/youtubei/v1/";
 const CLIENT_NAME: &str = "VISIONOS";
 /// `X-YouTube-Client-Name` for [`CLIENT_NAME`].
 const CLIENT_ID: &str = "101";
@@ -51,11 +55,32 @@ pub async fn resolve(http: &reqwest::Client, rustypipe: &RustyPipe, id: &str) ->
 }
 
 async fn player(http: &reqwest::Client, id: &str, visitor_data: &str) -> Result<Response> {
-    let body = serde_json::json!({
-        "videoId": id,
-        "contentCheckOk": true,
-        "racyCheckOk": true,
-        "context": {"client": {
+    let body = serde_json::json!({"videoId": id, "contentCheckOk": true, "racyCheckOk": true});
+    let bytes = request(http, "player", body, visitor_data).await?;
+    serde_json::from_slice(&bytes).context("unexpected player response")
+}
+
+/// The home feed's first page: the videos of every shelf on it, without duplicates.
+pub async fn home(http: &reqwest::Client, rustypipe: &RustyPipe) -> Result<Vec<VideoSummary>> {
+    let visitor_data = rustypipe.query().get_visitor_data(false).await?;
+    let body = serde_json::json!({"browseId": "FEwhat_to_watch"});
+    let bytes = request(http, "browse", body, &visitor_data).await?;
+    let response: serde_json::Value = serde_json::from_slice(&bytes).context("unexpected home feed response")?;
+    let videos = feed_videos(&response);
+    if videos.is_empty() {
+        bail!("the home feed is empty");
+    }
+    Ok(videos)
+}
+
+/// POST `body` (plus the client context) to an InnerTube endpoint; returns the response body.
+async fn request(
+    http: &reqwest::Client,
+    endpoint: &str,
+    mut body: serde_json::Value,
+    visitor_data: &str,
+) -> Result<Vec<u8>> {
+    body["context"] = serde_json::json!({"client": {
             "clientName": CLIENT_NAME,
             "clientVersion": CLIENT_VERSION,
             "osName": "visionOS",
@@ -66,10 +91,9 @@ async fn player(http: &reqwest::Client, id: &str, visitor_data: &str) -> Result<
             "userAgent": USER_AGENT,
             "visitorData": visitor_data,
             "hl": "en",
-        }},
-    });
+    }});
     let response = http
-        .post(PLAYER_URL)
+        .post(format!("{API_URL}{endpoint}?prettyPrint=false"))
         .header("Content-Type", "application/json")
         .header("User-Agent", USER_AGENT)
         .header("X-YouTube-Client-Name", CLIENT_ID)
@@ -80,13 +104,97 @@ async fn player(http: &reqwest::Client, id: &str, visitor_data: &str) -> Result<
         .body(body.to_string())
         .send()
         .await
-        .context("player request failed")?;
+        .with_context(|| format!("{endpoint} request failed"))?;
     let status = response.status();
-    let bytes = response.bytes().await.context("player request failed")?;
+    let bytes = response.bytes().await.with_context(|| format!("{endpoint} request failed"))?;
     if !status.is_success() {
-        bail!("player request: HTTP {status}");
+        bail!("{endpoint} request: HTTP {status}");
     }
-    serde_json::from_slice(&bytes).context("unexpected player response")
+    Ok(bytes.to_vec())
+}
+
+/// Every `compactVideoRenderer` in a browse response, wherever it sits, in order and without
+/// duplicates: the shelves around them change shape more often than the videos do.
+fn feed_videos(response: &serde_json::Value) -> Vec<VideoSummary> {
+    fn walk(value: &serde_json::Value, found: &mut Vec<VideoSummary>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(video) = map.get("compactVideoRenderer").and_then(compact_video) {
+                    if !found.iter().any(|known| known.video == video.video) {
+                        found.push(video);
+                    }
+                    return;
+                }
+                map.values().for_each(|value| walk(value, found));
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|value| walk(value, found)),
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    walk(response, &mut found);
+    found
+}
+
+/// The text of a `{"simpleText": …}` or `{"runs": [{"text": …}, …]}` value.
+fn text(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.get("simpleText").and_then(|text| text.as_str()) {
+        return Some(text.to_string());
+    }
+    let runs = value.get("runs")?.as_array()?;
+    let text: String = runs.iter().filter_map(|run| run.get("text")?.as_str()).collect();
+    (!text.is_empty()).then_some(text)
+}
+
+fn compact_video(renderer: &serde_json::Value) -> Option<VideoSummary> {
+    let id = renderer.get("videoId")?.as_str()?;
+    let field = |name: &str| renderer.get(name).and_then(text);
+    let thumbnails: Vec<Thumbnail> = renderer
+        .pointer("/thumbnail/thumbnails")
+        .and_then(|thumbnails| serde_json::from_value(thumbnails.clone()).ok())
+        .unwrap_or_default();
+    Some(VideoSummary {
+        video: VideoRef { source: super::ID, id: id.to_string() },
+        title: field("title")?,
+        channel: field("shortBylineText").or_else(|| field("longBylineText")),
+        views: field("viewCountText").and_then(|views| digits(&views)),
+        age: field("publishedTimeText"),
+        duration: field("lengthText").and_then(|length| clock(&length)),
+        thumbnail_url: pick_thumbnail(&thumbnails, 336),
+        is_short: false,
+    })
+}
+
+#[derive(Deserialize)]
+struct Thumbnail {
+    url: String,
+    #[serde(default)]
+    width: u32,
+}
+
+/// Smallest thumbnail at least `min_width` wide, else the largest.
+fn pick_thumbnail(thumbnails: &[Thumbnail], min_width: u32) -> Option<String> {
+    thumbnails
+        .iter()
+        .filter(|thumbnail| thumbnail.width >= min_width)
+        .min_by_key(|thumbnail| thumbnail.width)
+        .or_else(|| thumbnails.iter().max_by_key(|thumbnail| thumbnail.width))
+        .map(|thumbnail| thumbnail.url.clone())
+}
+
+/// "3,822,705 views" → 3822705.
+fn digits(text: &str) -> Option<u64> {
+    let digits: String = text.chars().filter(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// "1:02:26" → 3746 s.
+fn clock(text: &str) -> Option<std::time::Duration> {
+    let mut seconds = 0;
+    for part in text.trim().split(':') {
+        seconds = seconds * 60 + part.parse::<u64>().ok()?;
+    }
+    Some(std::time::Duration::from_secs(seconds))
 }
 
 #[derive(Deserialize)]
@@ -293,6 +401,31 @@ mod tests {
         let track = catalog.audio[0].track.as_ref().expect("track");
         assert_eq!((track.id.as_str(), track.is_default), ("en.4", true));
         assert!(!catalog.has_alternates);
+    }
+
+    #[test]
+    fn reads_home_feed_shelves() {
+        let json = r#"{"contents": {"singleColumnBrowseResultsRenderer": {"tabs": [{"tabRenderer": {"content":
+            {"sectionListRenderer": {"contents": [
+              {"shelfRenderer": {"title": {"runs": [{"text": "Recommended"}]}, "content": {"verticalListRenderer": {"items": [
+                {"compactVideoRenderer": {"videoId": "iJC87bWWuPM", "title": {"runs": [{"text": "I Investigated the Village"}]},
+                 "shortBylineText": {"runs": [{"text": "Nishu Tiwari"}]}, "viewCountText": {"simpleText": "3,822,705 views"},
+                 "publishedTimeText": {"simpleText": "1 day ago"}, "lengthText": {"simpleText": "30:20"},
+                 "thumbnail": {"thumbnails": [{"url": "https://i.ytimg.com/a/mq.jpg", "width": 320},
+                                              {"url": "https://i.ytimg.com/a/hq720.jpg", "width": 1280}]}}}]}}}},
+              {"shelfRenderer": {"content": {"verticalListRenderer": {"items": [
+                {"compactVideoRenderer": {"videoId": "iJC87bWWuPM", "title": {"simpleText": "duplicate"}}},
+                {"compactVideoRenderer": {"videoId": "8LRH9UpZc_s", "title": {"simpleText": "Jetha"},
+                 "lengthText": {"simpleText": "1:02:26"}}}]}}}}
+            ]}}}}]}}}"#;
+        let videos = feed_videos(&serde_json::from_str(json).unwrap());
+        assert_eq!(videos.len(), 2);
+        let first = &videos[0];
+        assert_eq!((first.video.id.as_str(), first.title.as_str()), ("iJC87bWWuPM", "I Investigated the Village"));
+        assert_eq!((first.channel.as_deref(), first.views), (Some("Nishu Tiwari"), Some(3_822_705)));
+        assert_eq!(first.duration, Some(std::time::Duration::from_secs(30 * 60 + 20)));
+        assert_eq!(first.thumbnail_url.as_deref(), Some("https://i.ytimg.com/a/hq720.jpg"));
+        assert_eq!(videos[1].duration, Some(std::time::Duration::from_secs(3746)));
     }
 
     #[test]

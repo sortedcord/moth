@@ -1,18 +1,22 @@
-//! The home page: a wireframe grid of the sample videos. Cards are absolutely positioned at
-//! their spring-animated geometry (see `layout.rs`), and only the ones near the scroll viewport
-//! are built.
+//! The home page: a grid of the sites' recommendations (after any featured videos). Cards are
+//! absolutely positioned at their spring-animated geometry (see `layout.rs`), and only the ones
+//! near the scroll viewport are built.
 
-use gpui::{Context, div, prelude::*, px, rgb, rgba};
+use gpui::{Context, Entity, ImageSource, div, prelude::*, px, rgb, rgba};
 
-use super::AppView;
+use super::components::thumbnail;
 use super::format;
+use super::images::ImageCache;
 use super::layout::{self, HomeLayout};
-use super::theme::{ACCENT, FAINT, HOVER, MUTED, TRACK};
+use super::theme::{ACCENT, HOVER, MUTED, TRACK};
+use super::{AppView, FeedStatus};
 use crate::backend::media::VideoSummary;
 
 pub fn render(
     layout: &HomeLayout,
     feed: &[VideoSummary],
+    status: &FeedStatus,
+    images: &Entity<ImageCache>,
     viewport_h: f32,
     cx: &mut Context<AppView>,
 ) -> impl IntoElement {
@@ -50,8 +54,16 @@ pub fn render(
         }
         let Some(video) = feed.get(ix % feed.len().max(1)) else { break };
         let highlight = show_targets && moving;
-        cards.push(card(ix, video, motion.x.value(), motion.y.value(), motion.w.value(), highlight, cx));
+        let image = video.thumbnail_url.as_deref().and_then(|url| images.read(cx).get(url));
+        let geometry = (motion.x.value(), motion.y.value(), motion.w.value());
+        cards.push(card(ix, video, image.map(ImageSource::from), geometry, highlight, cx));
     }
+    let notice = match status {
+        FeedStatus::Loading => Some("Loading recommendations…".to_string()),
+        FeedStatus::Failed(err) => Some(format!("Couldn't load recommendations: {err}")),
+        FeedStatus::Loaded if feed.is_empty() => Some("No recommendations.".to_string()),
+        FeedStatus::Loaded => None,
+    };
 
     div()
         .flex_1()
@@ -60,6 +72,7 @@ pub fn render(
         .flex_col()
         .gap_3()
         .child(div().flex_none().whitespace_nowrap().overflow_hidden().text_xs().text_color(rgb(MUTED)).child(hud))
+        .when_some(notice, |page, notice| page.child(div().flex_none().text_sm().text_color(rgb(MUTED)).child(notice)))
         .child(
             div()
                 .id("home-scroll")
@@ -71,13 +84,12 @@ pub fn render(
         )
 }
 
-/// Wireframe card: outlined boxes and single-line text, so width changes never re-wrap lines.
+/// A thumbnail over single-line text, so width changes never re-wrap lines.
 fn card(
     ix: usize,
     video: &VideoSummary,
-    x: f32,
-    y: f32,
-    w: f32,
+    image: Option<ImageSource>,
+    (x, y, w): (f32, f32, f32),
     highlight: bool,
     cx: &mut Context<AppView>,
 ) -> impl IntoElement + use<> {
@@ -107,22 +119,7 @@ fn card(
         .flex()
         .flex_col()
         .on_click(cx.listener(move |this, _, window, cx| this.open_video(target.clone(), window, cx)))
-        .child(
-            div()
-                .relative()
-                .flex_none()
-                .h(px(layout::thumb_h(w)))
-                .border_b_1()
-                .border_color(rgb(TRACK))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(rgb(FAINT))
-                .child(format!("#{ix}"))
-                .when_some(video.duration, |thumb, duration| {
-                    thumb.child(div().absolute().bottom_1().right_2().text_xs().child(format::clock(duration)))
-                }),
-        )
+        .child(thumbnail(image, video.duration.map(format::clock), px(w - 2.0), px(layout::thumb_h(w))))
         .child(line().pt_1().text_sm().child(video.title.clone()))
         .child(line().text_xs().text_color(rgb(MUTED)).child(meta))
 }
