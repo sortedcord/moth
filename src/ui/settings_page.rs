@@ -102,7 +102,7 @@ pub fn render(settings: &Settings, error: Option<SharedString>, cx: &mut Context
         ))
         .child(row(
             "Seekable stream URLs in the background",
-            "YouTube's iOS stream URLs only serve a little ahead of playback, so moth asks yt-dlp for web URLs to the same files. Costs a few seconds of CPU per video; without it, seeking far ahead can fail.",
+            "Only when YouTube's visionOS client fails and moth falls back to the iOS client, whose stream URLs only serve a little ahead of playback: moth then asks yt-dlp for web URLs to the same files. Costs a few seconds of CPU per video; without it, seeking far ahead can fail.",
             switch("seek-fallback", settings.seek_fallback, |s| s.seek_fallback = !s.seek_fallback, cx),
         ));
 

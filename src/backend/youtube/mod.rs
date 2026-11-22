@@ -1,13 +1,17 @@
-//! YouTube, via RustyPipe (YouTube's internal InnerTube API) with yt-dlp as a fallback.
+//! YouTube, via YouTube's internal InnerTube API: RustyPipe for video details, related videos
+//! and the home feed; streams from the first of these that works (see [`Resolver`]):
 //!
-//! RustyPipe currently gets streams from YouTube's iOS client, whose URLs only serve a little
-//! ahead of real-time playback. Web-client URLs for the same files don't have that limit, so the
-//! catalog offers them as alternate URLs (resolved by yt-dlp), which the player switches to when
-//! a long seek gets refused.
+//! 1. The visionOS client ([`visionos`]), whose URLs serve any byte range from the start.
+//! 2. RustyPipe, which gets streams from YouTube's iOS client. Those URLs only serve a little
+//!    ahead of real-time playback, so the catalog offers web-client URLs for the same files as
+//!    alternate URLs (resolved by yt-dlp), which the player switches to when a long seek gets
+//!    refused.
+//! 3. yt-dlp alone.
 //!
 //! yt-dlp's URLs have a catch of their own: YouTube may only start serving them a few seconds
 //! after handing them out. They leave this module once they work (see [`resolve_with_ytdlp`]).
 
+mod visionos;
 mod ytdlp;
 
 use std::time::Duration;
@@ -50,20 +54,46 @@ fn is_video_id(input: &str) -> bool {
     input.len() == 11 && input.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
+/// Where stream URLs come from, in the order they're tried.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Resolver {
+    #[default]
+    VisionOs,
+    RustyPipe,
+    YtDlp,
+}
+
+impl Resolver {
+    /// `visionos`, `rustypipe` or `yt-dlp`.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "visionos" => Some(Self::VisionOs),
+            "rustypipe" => Some(Self::RustyPipe),
+            "yt-dlp" | "ytdlp" => Some(Self::YtDlp),
+            _ => None,
+        }
+    }
+}
+
+const LIVE: &str = "Live streams aren't supported yet";
+
 pub struct YouTube {
     client: RustyPipe,
+    http: reqwest::Client,
+    /// Dev override: start the resolver chain further down.
+    first: Resolver,
     /// Dev override for yt-dlp's format selection.
     ytdlp_format: Option<String>,
 }
 
 impl YouTube {
     /// Must run inside the tokio runtime: RustyPipe's builder spawns background work.
-    pub async fn new(ytdlp_format: Option<String>) -> Result<Self> {
+    pub async fn new(http: reqwest::Client, first: Resolver, ytdlp_format: Option<String>) -> Result<Self> {
         let storage_dir = crate::paths::cache_dir();
         std::fs::create_dir_all(&storage_dir)
             .map_err(|err| anyhow!("failed to create {}: {err}", storage_dir.display()))?;
         let client = RustyPipe::builder().storage_dir(storage_dir).build()?;
-        Ok(Self { client, ytdlp_format })
+        Ok(Self { client, http, first, ytdlp_format })
     }
 }
 
@@ -120,27 +150,48 @@ impl VideoSource for YouTube {
 
     fn streams(&self, id: String, preferences: StreamPreferences) -> BoxFuture<StreamCatalog> {
         let client = self.client.clone();
+        let http = self.http.clone();
+        let first = self.first;
         let ytdlp_format = self.ytdlp_format.clone();
         Box::pin(async move {
-            let rustypipe_error = match client.query().player(&id).await {
-                Ok(player) if player.details.is_live => bail!("Live streams aren't supported yet"),
-                Ok(player) => {
-                    let catalog = catalog(&player);
-                    if !catalog.video.is_empty() && !catalog.audio.is_empty() {
-                        return Ok(catalog);
+            let mut failures = Vec::new();
+            if first <= Resolver::VisionOs {
+                match visionos::resolve(&http, &client, &id).await {
+                    Ok(visionos::Outcome::Streams(catalog)) => return Ok(catalog),
+                    Ok(visionos::Outcome::Live) => bail!(LIVE),
+                    Err(err) => {
+                        eprintln!("moth: the visionOS client gave no streams, trying RustyPipe: {err:#}");
+                        failures.push(format!("visionOS client: {err:#}"));
                     }
-                    anyhow!("no playable streams")
                 }
-                Err(err) => err.into(),
-            };
-            eprintln!("moth: RustyPipe stream resolution failed, trying yt-dlp: {rustypipe_error:#}");
+            }
+            if first <= Resolver::RustyPipe {
+                let error = match client.query().player(&id).await {
+                    Ok(player) if player.details.is_live => bail!(LIVE),
+                    Ok(player) => {
+                        let catalog = catalog(&player);
+                        if !catalog.video.is_empty() && !catalog.audio.is_empty() {
+                            return Ok(catalog);
+                        }
+                        anyhow!("no playable streams")
+                    }
+                    Err(err) => err.into(),
+                };
+                eprintln!("moth: RustyPipe stream resolution failed, trying yt-dlp: {error:#}");
+                failures.push(format!("RustyPipe: {error:#}"));
+            }
             let format = ytdlp_format.unwrap_or_else(|| ytdlp::format_for(&preferences));
             match resolve_with_ytdlp(id, format).await {
                 Ok(mut catalog) => {
-                    catalog.resolver_detail = "yt-dlp (RustyPipe failed)".to_string();
+                    if !failures.is_empty() {
+                        catalog.resolver_detail = "yt-dlp (fallback)".to_string();
+                    }
                     Ok(catalog)
                 }
-                Err(ytdlp_error) => bail!("RustyPipe: {rustypipe_error:#}\nyt-dlp: {ytdlp_error:#}"),
+                Err(error) => {
+                    failures.push(format!("yt-dlp: {error:#}"));
+                    bail!("{}", failures.join("\n"))
+                }
             }
         })
     }
@@ -281,9 +332,13 @@ mod tests {
     #[ignore]
     fn live_catalog() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
-        let youtube = runtime.block_on(YouTube::new(None)).expect("client");
         let preferences = StreamPreferences::default();
-        for id in ["WhWc3b3KhnY", "0e3GPea1Tyg"] {
+        for (first, id) in [
+            (Resolver::VisionOs, "WhWc3b3KhnY"),
+            (Resolver::VisionOs, "0e3GPea1Tyg"),
+            (Resolver::RustyPipe, "0e3GPea1Tyg"),
+        ] {
+            let youtube = runtime.block_on(YouTube::new(reqwest::Client::new(), first, None)).expect("client");
             let catalog = runtime.block_on(youtube.streams(id.to_string(), preferences.clone())).expect("streams");
             println!("== {id} via {}: qualities {:?}", catalog.resolver_detail, catalog.qualities());
             let video = catalog.auto_video(&preferences, None).expect("auto video");

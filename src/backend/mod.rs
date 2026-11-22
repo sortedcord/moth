@@ -34,6 +34,15 @@ pub struct Backend {
     sources: Vec<Arc<dyn VideoSource>>,
 }
 
+/// `MOTH_RESOLVER`, if set to one that exists.
+fn resolver(dev: &DevOptions) -> youtube::Resolver {
+    let Some(name) = &dev.resolver else { return youtube::Resolver::default() };
+    youtube::Resolver::parse(name).unwrap_or_else(|| {
+        eprintln!("moth: unknown MOTH_RESOLVER {name:?}; expected visionos, rustypipe or yt-dlp");
+        youtube::Resolver::default()
+    })
+}
+
 impl Backend {
     pub fn new(dev: &DevOptions) -> Result<Arc<Self>> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -43,7 +52,7 @@ impl Backend {
             .build()
             .context("failed to start tokio runtime")?;
         let http = reqwest::Client::builder().build()?;
-        let youtube = runtime.block_on(youtube::YouTube::new(dev.ytdlp_format.clone()))?;
+        let youtube = runtime.block_on(youtube::YouTube::new(http.clone(), resolver(dev), dev.ytdlp_format.clone()))?;
         let mut sources: Vec<Arc<dyn VideoSource>> = vec![Arc::new(youtube)];
         if let Some(dir) = &dev.media_dir {
             let _runtime = runtime.enter();

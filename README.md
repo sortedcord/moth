@@ -129,15 +129,18 @@ Metadata has the title, channel (`xesam:artist`), thumbnail, URL and length, plu
 ## How it works
 
 **YouTube access.**
-- Video details, related videos and stream URLs come from [RustyPipe](https://codeberg.org/ThetaDev/rustypipe)
-  (YouTube's internal API), in-process.
+- Video details and related videos come from [RustyPipe](https://codeberg.org/ThetaDev/rustypipe) (YouTube's
+  internal API), in-process.
+- Stream URLs come from YouTube's visionOS client, which moth asks directly over the same API. Its URLs are
+  plain (nothing to decipher, no PO token) and serve any part of the file straight away, so a far seek is a
+  single range request, as in a browser: about half a second until it plays again.
 - Streams are fetched by moth itself in bounded byte ranges (YouTube's CDN rejects un-ranged requests) and fed
   to GStreamer through an `appsrc`.
-- RustyPipe currently gets streams from YouTube's iOS client, whose URLs only serve a little ahead of real-time
-  playback. So [yt-dlp](https://github.com/yt-dlp/yt-dlp) resolves web-client URLs for the *same* files in the
-  background, and the player switches to them when a seek needs it. yt-dlp is also the full fallback if
-  RustyPipe fails. YouTube sometimes holds yt-dlp's URLs back for a few seconds (the slot of an ad before the
-  video); moth waits that out, so a far seek right after opening a video can take a moment.
+- If the visionOS client gives no streams, RustyPipe gets them from YouTube's iOS client instead. Those URLs only
+  serve a little ahead of real-time playback, so [yt-dlp](https://github.com/yt-dlp/yt-dlp) resolves web-client
+  URLs for the *same* files in the background, and the player switches to them when a seek needs it. yt-dlp is
+  also the last resort. YouTube sometimes holds yt-dlp's URLs back for a few seconds (the slot of an ad before
+  the video); moth waits that out, so on this path a far seek right after opening a video can take a while.
 
 **Playback.** A GStreamer pipeline: ranged `appsrc` → `decodebin3` → `waylandsink` for video and → `scaletempo`
 → `pulsesink` for audio. `waylandsink` shares gpui's Wayland connection and attaches a `wl_subsurface` to the
@@ -160,8 +163,8 @@ vendored at a pinned revision with a small local patch (`patches/`).
 See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the architecture, debug tools and conventions. Source layout:
 
 - `src/backend/`: everything that isn't UI, and nothing that depends on gpui
-  - `source.rs`: the `VideoSource` trait a site implements; `youtube/` is the only site so far (RustyPipe, with
-    yt-dlp as fallback and for seekable alternate URLs), and `local.rs` plays pre-downloaded videos for
+  - `source.rs`: the `VideoSource` trait a site implements; `youtube/` is the only site so far (RustyPipe, the
+    visionOS client for streams, yt-dlp as fallback and for seekable alternate URLs), and `local.rs` plays pre-downloaded videos for
     development (`scripts/fetch-dev-media.sh`)
   - `media.rs`, `selection.rs`: the site-neutral model (videos, streams, codecs) and stream selection
   - `player/`: the GStreamer pipeline, the ranged HTTP source and the Wayland embedding

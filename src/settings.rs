@@ -41,7 +41,8 @@ pub struct Settings {
     /// scrolled away, covered); audio plays on.
     pub suspend_hidden_video: bool,
     /// Resolve alternate stream URLs in the background for sources that offer them, so
-    /// seeking far ahead works (YouTube: web-client URLs via yt-dlp).
+    /// seeking far ahead works (YouTube, when it falls back to iOS-client URLs: web-client URLs via
+    /// yt-dlp).
     pub seek_fallback: bool,
 }
 

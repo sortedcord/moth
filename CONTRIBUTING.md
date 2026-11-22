@@ -56,6 +56,7 @@ script to add more videos. Home cards other than local ones, and related videos,
 | `F9` | Outline where each moving grid card is heading |
 | `F10` | 5× slow motion for layout animations |
 | `F8` / `MOTH_PLAYER_STATS=0\|1` | Player debug panel (a setting, on by default): clock, caps, dropped frames, queues, A/V offset, network |
+| `MOTH_RESOLVER=visionos\|rustypipe\|yt-dlp` | Where YouTube streams come from first; the later ones stay fallbacks (to test those paths) |
 | `MOTH_FORMAT=<yt-dlp format>` | Override the yt-dlp stream selection (e.g. to force AV1) |
 | `MOTH_DEV_MEDIA=<dir \| 0>` | Where the `local:` dev videos live (default in debug builds: `target/dev-media`) |
 | `moth status --watch` | Follow the running instance's state as JSON |
