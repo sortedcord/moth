@@ -8,7 +8,7 @@ power of watching in a browser tab, and it fits into the desktop: media keys, MP
 a browser extension that sends YouTube links to it.
 
 > **Status:** early and under active development. Watching videos works well; the home page shows YouTube's
-> signed-out recommendations (popular videos for your region), and there are no accounts, subscriptions or
+> recommendations (yours, once a recommendation account is signed in), and there are no subscriptions or
 > search yet. Linux + Wayland only.
 
 ## Features
@@ -25,6 +25,8 @@ a browser extension that sends YouTube links to it.
 - **Fluid UI.** Layout changes animate on springs instead of jumping, rendered with Vulkan.
 - **Light on resources.** While the window is out of sight (another workspace, scrolled away, covered), moth
   stops downloading and decoding video and only plays the audio; the picture catches up when you look again.
+- **Accounts.** A recommendation account for your own home feed, and a playback account for videos that need
+  you signed in, each signed in with a code at google.com/device or a browser session; kept in your keyring.
 - **Your defaults.** Preferred resolution and codecs, default speed, seek steps, animations and more are
   settings, not hardcoded choices.
 

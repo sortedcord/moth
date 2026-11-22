@@ -11,9 +11,12 @@
 //! yt-dlp's URLs have a catch of their own: YouTube may only start serving them a few seconds
 //! after handing them out. They leave this module once they work (see [`resolve_with_ytdlp`]).
 
+mod account;
+mod feed;
 mod visionos;
 mod ytdlp;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
@@ -23,6 +26,7 @@ use rustypipe::model::{
     AudioCodec as RpAudioCodec, Thumbnail, UrlTarget, VideoCodec as RpVideoCodec, VideoItem, VideoPlayer,
 };
 
+use super::accounts::Role;
 use super::media::{
     AlternateUrls, AudioCodec, AudioStream, AudioTrack, Channel, Link, Location, Published, StreamCatalog, StreamId,
     VideoCodec, VideoDetails, VideoRef, VideoStream, VideoSummary,
@@ -79,6 +83,8 @@ const LIVE: &str = "Live streams aren't supported yet";
 
 pub struct YouTube {
     client: RustyPipe,
+    /// Signed-in accounts, by role (see [`crate::backend::accounts`]).
+    accounts: [Arc<account::Account>; 2],
     http: reqwest::Client,
     /// Dev override: start the resolver chain further down.
     first: Resolver,
@@ -93,8 +99,31 @@ impl YouTube {
         std::fs::create_dir_all(&storage_dir)
             .map_err(|err| anyhow!("failed to create {}: {err}", storage_dir.display()))?;
         let client = RustyPipe::builder().storage_dir(storage_dir).build()?;
-        Ok(Self { client, http, first, ytdlp_format })
+        let accounts = [
+            Arc::new(account::Account::load(Role::Playback).await?),
+            Arc::new(account::Account::load(Role::Recommendations).await?),
+        ];
+        Ok(Self { client, accounts, http, first, ytdlp_format })
     }
+
+    pub fn account(&self, role: Role) -> Arc<account::Account> {
+        self.accounts.iter().find(|account| account.role() == role).expect("an account per role").clone()
+    }
+}
+
+/// The recommendation account's home feed, if it's signed in.
+async fn signed_in_home(account: &account::Account) -> Option<Result<Vec<VideoSummary>>> {
+    let (query, client) = account.query()?;
+    let result = async {
+        let response = query.raw(client, "browse", &serde_json::json!({"browseId": "FEwhat_to_watch"})).await?;
+        let response: serde_json::Value = serde_json::from_str(&response)?;
+        let videos = feed::videos(&response);
+        if videos.is_empty() {
+            bail!("the home feed is empty");
+        }
+        Ok(videos)
+    };
+    Some(result.await)
 }
 
 impl VideoSource for YouTube {
@@ -220,9 +249,18 @@ impl VideoSource for YouTube {
         }))
     }
 
+    /// The recommendation account's home feed when it's signed in, else the signed-out one.
     fn recommendations(&self) -> Option<BoxFuture<Vec<VideoSummary>>> {
         let (http, client) = (self.http.clone(), self.client.clone());
-        Some(Box::pin(async move { visionos::home(&http, &client).await }))
+        let account = self.account(Role::Recommendations);
+        Some(Box::pin(async move {
+            match signed_in_home(&account).await {
+                Some(Ok(videos)) => return Ok(videos),
+                Some(Err(err)) => eprintln!("moth: no signed-in home feed, showing the signed-out one: {err:#}"),
+                None => {}
+            }
+            visionos::home(&http, &client).await
+        }))
     }
 
     fn web_url(&self, id: &str) -> String {

@@ -1,12 +1,15 @@
 //! The settings page. Every option edits the [`Settings`] global, which is saved immediately.
 
-use gpui::{Context, FontWeight, SharedString, div, prelude::*, px, rgb};
+use gpui::{AnyElement, Context, Entity, FontWeight, SharedString, div, prelude::*, px, rgb};
 
 use super::AppView;
+use super::accounts::{AccountState, Accounts};
 use super::actions::SHORTCUTS;
 use super::components::{chip, chip_row, toggle};
 use super::format;
+use super::text_input::TextInput;
 use super::theme::{ACCENT, BG_BOTTOM, FAINT, MUTED, PANEL, TEXT, TRACK};
+use crate::backend::accounts::{Method, Role};
 use crate::backend::media::{AudioCodec, VideoCodec};
 use crate::settings::{Animations, RESOLUTIONS, SEEK_STEPS, SPEEDS, Settings};
 
@@ -60,7 +63,136 @@ fn switch(id: &'static str, on: bool, flip: fn(&mut Settings), cx: &mut Context<
     toggle(id, on).on_click(cx.listener(move |this, _, _, cx| this.update_settings(flip, cx)))
 }
 
-pub fn render(settings: &Settings, error: Option<SharedString>, cx: &mut Context<AppView>) -> impl IntoElement {
+/// Sign-in for each account role: a code, a pasted session, or the browser extension.
+pub fn accounts_section(
+    accounts: &Accounts,
+    cookie_input: &Entity<TextInput>,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let rows = Role::ALL.map(|role| {
+        let description = match role {
+            Role::Playback => {
+                "Plays videos that need you signed in, such as age-restricted ones. Premium's higher-bitrate \
+                 formats aren't supported yet."
+            }
+            Role::Recommendations => {
+                "Your home feed comes from this account, and the videos you watch go into its history."
+            }
+        };
+        let account = accounts.get(role);
+        let control = account_control(role, &account.state, cookie_input, cx);
+        let error = account.error.clone();
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(row(role.name(), description, control))
+            .when_some(error, |column, error| column.child(div().px_5().text_sm().text_color(rgb(ACCENT)).child(error)))
+    });
+    section("YOUTUBE ACCOUNTS")
+        .children(rows)
+        .child(div().px_1().text_xs().text_color(rgb(FAINT)).line_height(px(18.0)).child(
+            "Sign in with a code at google.com/device, or with a signed-in browser session: paste its cookies, \
+             or use Share account in the moth browser extension. Sign-ins are kept in your keyring.",
+        ))
+        .into_any_element()
+}
+
+fn account_control(
+    role: Role,
+    state: &AccountState,
+    cookie_input: &Entity<TextInput>,
+    cx: &mut Context<AppView>,
+) -> AnyElement {
+    let button = |id: &'static str, label: &'static str| chip((id, role as usize), label, false);
+    match state {
+        AccountState::SignedOut => chip_row()
+            .child(
+                button("sign-in-code", "Sign in with a code")
+                    .on_click(cx.listener(move |this, _, window, cx| this.sign_in_with_code(role, window, cx))),
+            )
+            .child(
+                button("sign-in-cookies", "Paste cookies")
+                    .on_click(cx.listener(move |this, _, window, cx| this.open_cookie_field(role, window, cx))),
+            )
+            .into_any_element(),
+        AccountState::SignedIn(info) => {
+            let via = match info.method {
+                Method::DeviceCode => "signed in with a code",
+                Method::Cookies => "browser session",
+            };
+            let who = match &info.handle {
+                Some(handle) => format!("{} ({handle})", info.name),
+                None => info.name.clone(),
+            };
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_end()
+                        .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(who))
+                        .child(div().text_xs().text_color(rgb(MUTED)).child(via)),
+                )
+                .child(
+                    button("sign-out", "Sign out")
+                        .on_click(cx.listener(move |this, _, window, cx| this.sign_out(role, window, cx))),
+                )
+                .into_any_element()
+        }
+        AccountState::DeviceCode(code) => div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_end()
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(format!("Enter at {}", code.url)))
+                    .child(
+                        div().text_xl().font_weight(FontWeight::BOLD).text_color(rgb(TEXT)).child(code.code.clone()),
+                    ),
+            )
+            .child(
+                button("cancel", "Cancel").on_click(cx.listener(move |this, _, _, cx| this.cancel_sign_in(role, cx))),
+            )
+            .into_any_element(),
+        AccountState::PastingCookies => div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(
+                div()
+                    .w(px(320.0))
+                    .h(px(36.0))
+                    .px_3()
+                    .rounded_lg()
+                    .bg(rgb(BG_BOTTOM))
+                    .border_1()
+                    .border_color(rgb(TRACK))
+                    .flex()
+                    .items_center()
+                    .overflow_hidden()
+                    .child(cookie_input.clone()),
+            )
+            .child(
+                button("cancel", "Cancel").on_click(cx.listener(move |this, _, _, cx| this.cancel_sign_in(role, cx))),
+            )
+            .into_any_element(),
+        AccountState::Working(what) => div().text_sm().text_color(rgb(MUTED)).child(*what).into_any_element(),
+    }
+}
+
+pub fn render(
+    settings: &Settings,
+    error: Option<SharedString>,
+    accounts: AnyElement,
+    cx: &mut Context<AppView>,
+) -> impl IntoElement {
     let seconds = |step: u32| format!("{step} s");
     let playback = section("PLAYBACK")
         .child(row(
@@ -181,6 +313,7 @@ pub fn render(settings: &Settings, error: Option<SharedString>, cx: &mut Context
             .gap_6()
             .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child("Settings"))
             .child(playback)
+            .child(accounts)
             .child(seeking)
             .child(interface)
             .child(

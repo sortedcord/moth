@@ -3,9 +3,11 @@
 //! Nothing in here depends on gpui. The UI talks to sites only through [`Backend`] and the
 //! neutral types in [`media`], and to GStreamer only through [`player`].
 
+pub mod accounts;
 mod local;
 pub mod media;
 pub mod player;
+mod secrets;
 pub mod selection;
 pub mod source;
 mod youtube;
@@ -16,6 +18,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result, anyhow, bail};
 
 use crate::dev::DevOptions;
+use accounts::{AccountInfo, DeviceCode, Role};
 use media::{AlternateUrls, Link, Selection, StreamCatalog, VideoDetails, VideoRef, VideoSummary};
 use selection::StreamPreferences;
 use source::VideoSource;
@@ -31,6 +34,8 @@ pub struct Backend {
     runtime: tokio::runtime::Runtime,
     http: reqwest::Client,
     sources: Vec<Arc<dyn VideoSource>>,
+    /// The only source with accounts so far.
+    youtube: Arc<youtube::YouTube>,
 }
 
 /// `MOTH_RESOLVER`, if set to one that exists.
@@ -51,8 +56,9 @@ impl Backend {
             .build()
             .context("failed to start tokio runtime")?;
         let http = reqwest::Client::builder().build()?;
-        let youtube = runtime.block_on(youtube::YouTube::new(http.clone(), resolver(dev), dev.ytdlp_format.clone()))?;
-        let mut sources: Vec<Arc<dyn VideoSource>> = vec![Arc::new(youtube)];
+        let youtube =
+            Arc::new(runtime.block_on(youtube::YouTube::new(http.clone(), resolver(dev), dev.ytdlp_format.clone()))?);
+        let mut sources: Vec<Arc<dyn VideoSource>> = vec![youtube.clone()];
         if let Some(dir) = &dev.media_dir {
             let _runtime = runtime.enter();
             match local::Local::new(dir) {
@@ -61,7 +67,7 @@ impl Backend {
                 Err(err) => eprintln!("moth: local videos unavailable: {err:#}"),
             }
         }
-        Ok(Arc::new(Self { runtime, http, sources }))
+        Ok(Arc::new(Self { runtime, http, sources, youtube }))
     }
 
     pub fn http(&self) -> Http {
@@ -154,6 +160,56 @@ impl Backend {
             }
             Ok(videos)
         })
+    }
+
+    // ── Accounts ─────────────────────────────────────────────────────────────
+
+    /// Who's signed in for `role`, if anyone.
+    pub fn account(&self, role: Role) -> Option<AccountInfo> {
+        self.youtube.account(role).info()
+    }
+
+    /// Look up the signed-in accounts' names (at startup they're only known to be signed in).
+    pub fn refresh_accounts(&self) -> impl Future<Output = Result<()>> + use<> {
+        let accounts: Vec<_> = Role::ALL.iter().map(|role| self.youtube.account(*role)).collect();
+        self.run(async move {
+            for account in accounts.iter().filter(|account| account.method().is_some()) {
+                if let Err(err) = account.refresh_info().await {
+                    eprintln!("moth: couldn't look up the YouTube {}: {err:#}", account.role().name().to_lowercase());
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Start a device sign-in for `role`; show the code, then await [`Self::finish_device_sign_in`].
+    pub fn begin_device_sign_in(&self, role: Role) -> impl Future<Output = Result<DeviceCode>> + use<> {
+        let account = self.youtube.account(role);
+        self.run(async move { account.begin_device_sign_in().await })
+    }
+
+    pub fn finish_device_sign_in(&self, role: Role) -> impl Future<Output = Result<AccountInfo>> + use<> {
+        let account = self.youtube.account(role);
+        self.run(async move { account.finish_device_sign_in().await })
+    }
+
+    pub fn cancel_device_sign_in(&self, role: Role) {
+        self.youtube.account(role).cancel_device_sign_in();
+    }
+
+    /// Sign `role` in with a browser session's cookies (a `Cookie` header or a cookies.txt).
+    pub fn sign_in_with_cookies(
+        &self,
+        role: Role,
+        cookies: String,
+    ) -> impl Future<Output = Result<AccountInfo>> + use<> {
+        let account = self.youtube.account(role);
+        self.run(async move { account.sign_in_with_cookies(&cookies).await })
+    }
+
+    pub fn sign_out(&self, role: Role) -> impl Future<Output = Result<()>> + use<> {
+        let account = self.youtube.account(role);
+        self.run(async move { account.sign_out().await })
     }
 
     pub fn web_url(&self, video: &VideoRef) -> Option<String> {

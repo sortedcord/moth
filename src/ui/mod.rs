@@ -4,6 +4,7 @@
 //! [`AppView`] is the window's root: it owns navigation (home, watch, settings), the top bar and
 //! the sidebar, and routes external commands. Pages with state of their own are entities.
 
+mod accounts;
 mod actions;
 mod components;
 mod format;
@@ -130,6 +131,9 @@ pub struct AppView {
     images: Entity<ImageCache>,
     address: Entity<TextInput>,
     address_error: Option<SharedString>,
+    accounts: accounts::Accounts,
+    /// Where a browser session's cookies are pasted, on the settings page.
+    cookie_input: Entity<TextInput>,
     settings_error: Option<SharedString>,
     layout: HomeLayout,
     feed: Vec<VideoSummary>,
@@ -177,9 +181,23 @@ impl AppView {
                 cx,
             )
         });
+        let cookie_input = cx.new(|cx| {
+            TextInput::new(
+                "Paste a Cookie header or cookies.txt and press Enter",
+                rgb(TEXT).into(),
+                rgb(FAINT).into(),
+                rgb(ACCENT).into(),
+                cx,
+            )
+        });
         let subscriptions = vec![
             cx.subscribe_in(&address, window, |this, _, event: &Submit, window, cx| {
                 this.submit_address(event.0.to_string(), window, cx);
+            }),
+            cx.subscribe_in(&cookie_input, window, |this, _, event: &Submit, window, cx| {
+                if let Some(role) = this.accounts.pasting() {
+                    this.sign_in_with_cookies(role, event.0.to_string(), window, cx);
+                }
             }),
             cx.observe_in(&session, window, |this, _, window, cx| {
                 this.publish(window, cx);
@@ -208,6 +226,8 @@ impl AppView {
             images: cx.new(|_| ImageCache::default()),
             address,
             address_error: None,
+            accounts: accounts::Accounts::new(cx),
+            cookie_input,
             settings_error: None,
             layout: HomeLayout::new(dev.cards.unwrap_or(feed.len())),
             feed,
@@ -226,6 +246,7 @@ impl AppView {
         };
         cx.observe(&view.images, |_, _, cx| cx.notify()).detach();
         view.load_feed(window, cx);
+        view.refresh_accounts(window, cx);
         if let Some(link) = open {
             view.submit_address(link, window, cx);
         } else if let Some(target) = dev.open {
@@ -236,6 +257,14 @@ impl AppView {
             }
         }
         view
+    }
+
+    /// Start the home page over: the featured videos, then fresh recommendations (e.g. after
+    /// the recommendation account changed).
+    fn reload_feed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.feed = cx.global::<BackendHandle>().0.featured();
+        self.layout.set_count(self.feed.len());
+        self.load_feed(window, cx);
     }
 
     /// Fetch the home page's recommendations (after the featured videos already there).
@@ -566,7 +595,9 @@ impl Render for AppView {
                     Route::Settings => {
                         let settings = cx.global::<Settings>().clone();
                         let error = self.settings_error.clone();
-                        (sidebar::Entry::Settings, settings_page::render(&settings, error, cx).into_any_element())
+                        let accounts = settings_page::accounts_section(&self.accounts, &self.cookie_input, cx);
+                        let page = settings_page::render(&settings, error, accounts, cx);
+                        (sidebar::Entry::Settings, page.into_any_element())
                     }
                     _ => (
                         sidebar::Entry::Home,
