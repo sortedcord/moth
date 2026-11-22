@@ -142,8 +142,9 @@ impl Location {
     }
 }
 
-/// Identifies a stream within its catalog. What the number means is up to the source (YouTube
-/// uses format itags), so only compare ids from the same catalog.
+/// Identifies a stream within its catalog: unique among the catalog's video streams, and among
+/// its audio streams. What the number means is up to the source (YouTube uses format itags), so
+/// only compare ids from the same catalog.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct StreamId(pub u64);
 

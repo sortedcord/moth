@@ -157,7 +157,10 @@ impl VideoSource for YouTube {
             let mut failures = Vec::new();
             if first <= Resolver::VisionOs {
                 match visionos::resolve(&http, &client, &id).await {
-                    Ok(visionos::Outcome::Streams(catalog)) => return Ok(catalog),
+                    Ok(visionos::Outcome::Streams(mut catalog)) => {
+                        number_tracks(&mut catalog);
+                        return Ok(catalog);
+                    }
                     Ok(visionos::Outcome::Live) => bail!(LIVE),
                     Err(err) => {
                         eprintln!("moth: the visionOS client gave no streams, trying RustyPipe: {err:#}");
@@ -169,7 +172,8 @@ impl VideoSource for YouTube {
                 let error = match client.query().player(&id).await {
                     Ok(player) if player.details.is_live => bail!(LIVE),
                     Ok(player) => {
-                        let catalog = catalog(&player);
+                        let mut catalog = catalog(&player);
+                        number_tracks(&mut catalog);
                         if !catalog.video.is_empty() && !catalog.audio.is_empty() {
                             return Ok(catalog);
                         }
@@ -197,7 +201,16 @@ impl VideoSource for YouTube {
     }
 
     fn alternate_urls(&self, id: String, video: &VideoStream, audio: &AudioStream) -> Option<BoxFuture<AlternateUrls>> {
-        let format = format!("{}+{}", video.id.0, audio.id.0);
+        let audio_format = match &audio.track {
+            // Dubs share the itag; yt-dlp tells them apart by language (and lists the default
+            // track's "stable volume" copy under the same itag, as `-drc`).
+            Some(track) => {
+                let language = track.id.split('.').next().unwrap_or_default();
+                format!("(ba[format_id^={itag}-][format_id!$=-drc][language={language}]/{itag})", itag = itag(audio.id))
+            }
+            None => itag(audio.id).to_string(),
+        };
+        let format = format!("{}+{audio_format}", itag(video.id));
         Some(Box::pin(async move {
             let catalog = resolve_with_ytdlp(id, format).await?;
             match (catalog.video.into_iter().next(), catalog.audio.into_iter().next()) {
@@ -214,6 +227,25 @@ impl VideoSource for YouTube {
     fn thumbnail_url(&self, id: &str) -> Option<String> {
         Some(format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"))
     }
+}
+
+/// Give each audio track's streams their own ids: every dub of a format has the same itag, so
+/// the id is the itag plus, in the bits above it, the track's position among the video's tracks.
+fn number_tracks(catalog: &mut StreamCatalog) {
+    let mut tracks: Vec<String> = Vec::new();
+    for stream in &mut catalog.audio {
+        let Some(track) = &stream.track else { continue };
+        let index = tracks.iter().position(|known| *known == track.id).unwrap_or_else(|| {
+            tracks.push(track.id.clone());
+            tracks.len() - 1
+        });
+        stream.id = StreamId(stream.id.0 | (index as u64) << 32);
+    }
+}
+
+/// The itag of a stream (see [`number_tracks`]).
+fn itag(id: StreamId) -> u64 {
+    id.0 & 0xffff_ffff
 }
 
 /// Have yt-dlp resolve `format` of a video, and return its catalog once the URLs in it work.
@@ -327,6 +359,42 @@ mod tests {
         assert!(!is_video_id("not an id"));
     }
 
+    fn audio(itag: u64, track: Option<&str>) -> AudioStream {
+        AudioStream {
+            id: StreamId(itag),
+            location: Location::new(format!("https://a/{itag}/{}", track.unwrap_or("-"))),
+            codec: AudioCodec::Opus,
+            bitrate: None,
+            size: None,
+            track: track.map(|id| AudioTrack { id: id.to_string(), name: id.to_string(), is_default: id == "en.4" }),
+        }
+    }
+
+    #[test]
+    fn dubs_get_their_own_ids() {
+        let mut catalog = StreamCatalog {
+            video: Vec::new(),
+            audio: vec![
+                audio(251, Some("en.4")),
+                audio(140, Some("en.4")),
+                audio(251, Some("de.3")),
+                audio(140, Some("de.3")),
+            ],
+            resolver: "test",
+            resolver_detail: String::new(),
+            has_alternates: false,
+        };
+        number_tracks(&mut catalog);
+        let ids: Vec<_> = catalog.audio.iter().map(|audio| audio.id).collect();
+        assert_eq!(ids, [StreamId(251), StreamId(140), StreamId(251 | 1 << 32), StreamId(140 | 1 << 32)]);
+        assert_eq!(catalog.audio_stream(ids[2]).map(|audio| audio.location.url.as_str()), Some("https://a/251/de.3"));
+        assert_eq!(itag(ids[3]), 140);
+        // No tracks: ids stay itags.
+        let mut single = StreamCatalog { audio: vec![audio(251, None)], ..catalog };
+        number_tracks(&mut single);
+        assert_eq!(single.audio[0].id, StreamId(251));
+    }
+
     /// Network test: `cargo test -- --ignored --nocapture live_catalog`
     #[test]
     #[ignore]
@@ -345,6 +413,10 @@ mod tests {
             assert!(video.resolution() <= preferences.max_height);
             let audio = catalog.audio_in_track(None, &preferences);
             assert_eq!(audio.first().map(|a| a.codec), Some(AudioCodec::Opus));
+            let mut ids: Vec<_> = catalog.audio.iter().map(|audio| audio.id).collect();
+            ids.sort_by_key(|id| id.0);
+            ids.dedup();
+            assert_eq!(ids.len(), catalog.audio.len(), "audio ids must be unique");
             for track in catalog.tracks().iter().filter(|track| !track.is_default).take(1) {
                 let streams = catalog.audio_in_track(Some(&track.id), &preferences);
                 assert!(streams.iter().all(|a| a.track.as_ref().map(|t| &t.id) == Some(&track.id)));
