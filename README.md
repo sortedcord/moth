@@ -89,8 +89,15 @@ video switches there; otherwise moth starts. Embedded players are left alone.
 3. In the browser, open the extensions page, enable *Developer mode*, choose *Load unpacked* and
    select the `extension/` folder.
 
-Clicking the toolbar icon turns the redirect off and on. If moth can't be reached, the page offers
-to watch in the browser instead.
+The toolbar icon opens a popup with a switch that turns the redirect off and on. If moth can't be
+reached, the page offers to watch in the browser instead.
+
+The popup can also **share the browser's YouTube account** with moth: *Share as recommendation account* or
+*Share as playback account* sends the browser's youtube.com session (its cookies, read with the `cookies`
+permission) to the running moth, which signs that account in and shows the result in its settings. YouTube
+rotates a session's cookies now and then, and a session used in two places can occasionally sign one of
+them out; signing in with a code (Settings → YouTube accounts) avoids that. After updating the extension,
+reload it on the extensions page; it asks for the new permission.
 
 How it works: full page loads of `youtube.com/watch` (and `youtu.be` links, which redirect there)
 are redirected by a declarativeNetRequest rule to the extension's handoff page; YouTube's in-page

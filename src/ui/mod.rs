@@ -403,6 +403,11 @@ impl AppView {
             Command::Raise => window.activate_window(),
             // Quitting this way skips the window-closed hook.
             Command::Quit => quit(cx),
+            Command::SignIn { role, cookies } => {
+                window.activate_window();
+                self.open_settings(window, cx);
+                self.sign_in_with_cookies(role, cookies, window, cx);
+            }
         }
     }
 

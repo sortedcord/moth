@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>moth</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0; width: 19rem; padding: 1rem 1.1rem 1.1rem;
+      background: linear-gradient(160deg, #1d2540, #131929); color: #e8ebf4;
+      font: 14px/1.45 system-ui, sans-serif;
+    }
+    h2 { font-size: .72rem; letter-spacing: .06em; color: #6b7490; margin: 1rem 0 .45rem; }
+    h2:first-child { margin-top: 0; }
+    label { display: flex; align-items: center; justify-content: space-between; gap: 1rem; cursor: pointer; }
+    p { color: #9aa3bb; margin: 0 0 .6rem; font-size: .85rem; }
+    .buttons { display: flex; flex-direction: column; gap: .4rem; }
+    button {
+      font: inherit; font-weight: 600; color: #e8ebf4; background: #29334f; border: 0; text-align: left;
+      border-radius: .6rem; padding: .5rem .75rem; cursor: pointer;
+    }
+    button:hover { background: #343e5c; }
+    button:disabled { opacity: .6; cursor: default; }
+    #status { margin: .6rem 0 0; min-height: 1.2em; }
+    #status.error { color: #ff8a95; }
+    #status.ok { color: #8fd19e; }
+  </style>
+</head>
+<body>
+  <h2>VIDEOS</h2>
+  <label>Open YouTube videos in moth <input type="checkbox" id="enabled"></label>
+  <h2>ACCOUNT</h2>
+  <p>Sign moth in with the YouTube account this browser is signed in to. moth must be running.</p>
+  <div class="buttons">
+    <button data-role="recommendations">Share as recommendation account</button>
+    <button data-role="playback">Share as playback account</button>
+  </div>
+  <p id="status"></p>
+  <script src="popup.js"></script>
+</body>
+</html>

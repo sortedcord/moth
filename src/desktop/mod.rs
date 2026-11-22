@@ -9,6 +9,7 @@ pub mod native_host;
 pub mod socket;
 pub mod status;
 
+use crate::backend::accounts::Role;
 use std::time::Duration;
 
 /// Requests from outside (socket, MPRIS) for the UI thread.
@@ -24,6 +25,11 @@ pub enum Command {
     SetRate(f64),
     Raise,
     Quit,
+    /// Sign an account in with a browser session's cookies (from the browser extension).
+    SignIn {
+        role: Role,
+        cookies: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

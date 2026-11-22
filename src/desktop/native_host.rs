@@ -1,6 +1,9 @@
 //! The browser extension's native-messaging host. A Chromium-based browser starts moth with the
-//! calling extension's origin as the first argument; moth reads one `{"url": …}` message from
-//! stdin, forwards it to the running instance (or launches one), and replies `{"ok": …}`.
+//! calling extension's origin as the first argument; moth reads one message from stdin, passes
+//! it on to the running instance, and replies `{"ok": …}`:
+//! - `{"url": …}`: open the link (launching moth if it isn't running).
+//! - `{"account": "playback" | "recommendations", "cookies": …}`: sign that account in with the
+//!   browser's YouTube session (moth must be running, to show how it went).
 
 use std::io::{Read, Write};
 use std::os::unix::process::CommandExt as _;
@@ -9,6 +12,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context as _, Result, bail};
 
 use super::socket;
+use crate::backend::accounts::Role;
 
 /// Whether moth was started by a browser as a native-messaging host.
 pub fn is_invocation(args: &[String]) -> bool {
@@ -29,6 +33,13 @@ pub fn run() -> i32 {
 
 fn handle_message() -> Result<()> {
     let message = read_message()?;
+    if let Some(role) = message.get("account").and_then(|role| role.as_str()) {
+        let role = Role::parse(role).with_context(|| format!("no such account: {role}"))?;
+        let cookies =
+            message.get("cookies").and_then(|cookies| cookies.as_str()).context("message has no \"cookies\"")?;
+        return socket::share_account(role, cookies)
+            .context("moth isn't running; start it and share the account again");
+    }
     let url = message.get("url").and_then(|url| url.as_str()).context("message has no \"url\"")?.trim().to_string();
     if !crate::backend::source::claims_url(&url) {
         bail!("not a link moth can open: {url}");

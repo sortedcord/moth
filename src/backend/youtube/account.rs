@@ -161,13 +161,19 @@ impl Account {
         if cookies.is_empty() {
             bail!("no cookies");
         }
-        self.sign_out_quietly().await;
         let result = if cookies.contains('\t') {
             self.client.user_auth_set_cookie_txt(cookies).await
         } else {
             self.client.user_auth_set_cookie(cookies).await
         };
+        // Cookies YouTube refuses aren't stored, and the previous sign-in stays.
         result.context("YouTube didn't accept those cookies as a signed-in session")?;
+        // One method at a time: the session replaces a code sign-in (whose token is revoked).
+        if self.client.query().auth_enabled_client(&[ClientType::Tv]).is_some()
+            && let Err(err) = self.client.user_auth_logout().await
+        {
+            eprintln!("moth: couldn't revoke the previous sign-in: {err:#}");
+        }
         self.signed_in(Method::Cookies).await
     }
 
@@ -193,15 +199,6 @@ impl Account {
         };
         *lock(&self.info) = None;
         result.context("couldn't sign out")
-    }
-
-    /// Clear any previous sign-in before a new one, so an account has one method at a time.
-    async fn sign_out_quietly(&self) {
-        if self.method().is_some()
-            && let Err(err) = self.sign_out().await
-        {
-            eprintln!("moth: {err:#}");
-        }
     }
 }
 

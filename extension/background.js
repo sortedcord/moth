@@ -1,7 +1,8 @@
 // Full page loads of watch URLs are redirected to handoff.html by the declarativeNetRequest rules
 // (rules.json) before YouTube loads anything. This worker covers the rest: YouTube's in-page
-// navigation (clicking a video on youtube.com changes the URL without a page load), and the
-// toolbar button that turns the whole thing on and off.
+// navigation (clicking a video on youtube.com changes the URL without a page load), and what the
+// toolbar popup (popup.html) asks for: turning the whole thing on and off, and sharing the
+// browser's YouTube session with moth as one of its accounts.
 
 const HOST = "dev.moth.open";
 const WATCH_HOSTS = new Set(["www.youtube.com", "youtube.com", "m.youtube.com"]);
@@ -31,15 +32,49 @@ async function applyEnabled(enabled) {
   await chrome.action.setBadgeText({ text: enabled ? "" : "off" });
   await chrome.action.setBadgeBackgroundColor({ color: "#6b7490" });
   await chrome.action.setTitle({
-    title: enabled
-      ? "YouTube videos open in moth (click to turn off)"
-      : "YouTube videos open in the browser (click to turn on)",
+    title: enabled ? "moth: YouTube videos open in moth" : "moth: YouTube videos open in the browser",
   });
 }
 
+/** The browser's youtube.com session as a Cookie header (one value per name, `.youtube.com` first). */
+async function youtubeSession() {
+  const cookies = await chrome.cookies.getAll({ domain: "youtube.com" });
+  const byName = new Map();
+  for (const cookie of cookies) {
+    if (!byName.has(cookie.name) || cookie.domain === ".youtube.com") byName.set(cookie.name, cookie);
+  }
+  if (!byName.has("SAPISID") && !byName.has("__Secure-3PAPISID")) {
+    throw new Error("This browser isn't signed in to YouTube.");
+  }
+  return [...byName.values()].map((cookie) => `${cookie.name}=${cookie.value}`).join("; ");
+}
+
+async function shareAccount(role) {
+  const reply = await chrome.runtime.sendNativeMessage(HOST, { account: role, cookies: await youtubeSession() });
+  if (!reply?.ok) throw new Error(reply?.error ?? "moth didn't answer");
+}
+
+chrome.runtime.onMessage.addListener((message, _sender, respond) => {
+  const handle = async () => {
+    switch (message?.type) {
+      case "getEnabled":
+        return { enabled: await isEnabled() };
+      case "setEnabled":
+        await applyEnabled(Boolean(message.enabled));
+        return { ok: true };
+      case "shareAccount":
+        await shareAccount(message.role);
+        return { ok: true };
+      default:
+        return { ok: false, error: "unknown request" };
+    }
+  };
+  handle().then(respond, (err) => respond({ ok: false, error: String(err.message ?? err) }));
+  return true; // respond asynchronously
+});
+
 chrome.runtime.onInstalled.addListener(async () => applyEnabled(await isEnabled()));
 chrome.runtime.onStartup.addListener(async () => applyEnabled(await isEnabled()));
-chrome.action.onClicked.addListener(async () => applyEnabled(!(await isEnabled())));
 
 chrome.webNavigation.onCommitted.addListener((details) => {
   if (details.frameId !== 0) return;

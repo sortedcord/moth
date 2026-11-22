@@ -4,6 +4,9 @@
 //! - `status`: answered with one JSON line describing what's playing ([`NowPlaying`]).
 //! - `watch`: the same JSON line now, then another every time it changes (the position counts in
 //!   whole seconds), until the client hangs up. `moth status [--watch]` wraps both.
+//! - `account <role> <cookies>`: sign the `playback` or `recommendations` account in with a
+//!   browser session's `Cookie` header (answered with `ok` once accepted; the result shows on the
+//!   settings page). The browser extension's "share account" button sends this.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -15,6 +18,7 @@ use anyhow::{Context as _, Result, bail};
 
 use super::status::{Hub, NowPlaying};
 use super::{Command, Commands};
+use crate::backend::accounts::Role;
 use crate::sync::lock;
 
 pub fn path() -> PathBuf {
@@ -31,9 +35,21 @@ unsafe extern "C" {
 
 /// Hand `url` to an already-running moth. Fails if there is none.
 pub fn send_to_running(url: &str) -> Result<()> {
+    send_line(url.trim())
+}
+
+/// Hand a browser session to an already-running moth, to sign `role` in with.
+pub fn share_account(role: Role, cookies: &str) -> Result<()> {
+    if cookies.contains(['\n', '\r']) {
+        bail!("cookies can't span lines");
+    }
+    send_line(&format!("account {} {}", role.key(), cookies.trim()))
+}
+
+fn send_line(line: &str) -> Result<()> {
     let mut stream = UnixStream::connect(path())?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    writeln!(stream, "{}", url.trim())?;
+    writeln!(stream, "{line}")?;
     let mut reply = String::new();
     BufReader::new(stream).read_line(&mut reply)?;
     if reply.trim() != "ok" {
@@ -79,6 +95,17 @@ fn serve(mut stream: UnixStream, commands: &Commands, hub: &Hub) {
             return;
         }
         "" => "error\n".to_string(),
+        line if line.starts_with("account ") => {
+            let mut parts = line.splitn(3, ' ').skip(1);
+            let command = match (parts.next().and_then(Role::parse), parts.next()) {
+                (Some(role), Some(cookies)) if !cookies.is_empty() => {
+                    Some(Command::SignIn { role, cookies: cookies.to_string() })
+                }
+                _ => None,
+            };
+            let accepted = command.is_some_and(|command| commands.send_blocking(command).is_ok());
+            if accepted { "ok\n" } else { "error\n" }.to_string()
+        }
         url => {
             let accepted = commands.send_blocking(Command::Open(url.to_string())).is_ok();
             if accepted { "ok\n" } else { "error\n" }.to_string()

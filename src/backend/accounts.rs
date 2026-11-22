@@ -23,6 +23,10 @@ impl Role {
         }
     }
 
+    pub fn parse(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|role| role.key() == key)
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Playback => "Playback account",
