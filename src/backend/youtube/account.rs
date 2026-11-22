@@ -105,6 +105,11 @@ impl Account {
         Some(serde_json::from_str::<Cache>(&cache).ok()?.auth_cookie?.cookie)
     }
 
+    /// An OAuth access token, for a device sign-in (refreshed as needed).
+    pub async fn access_token(&self) -> Result<String> {
+        Ok(self.client.user_auth_access_token().await?)
+    }
+
     /// Look up the account's name. Errors leave the info as it was.
     pub async fn refresh_info(&self) -> Result<AccountInfo> {
         let method = self.method().ok_or_else(|| anyhow!("not signed in"))?;

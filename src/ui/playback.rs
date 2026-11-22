@@ -15,7 +15,9 @@ use gpui::{App, Context, Task};
 
 use super::BackendHandle;
 use crate::backend::Backend;
-use crate::backend::media::{AudioStream, Selection, StreamCatalog, StreamId, VideoCodec, VideoRef, VideoStream};
+use crate::backend::media::{
+    AudioStream, Selection, StreamCatalog, StreamId, VideoCodec, VideoRef, VideoStream, Watching,
+};
 use crate::backend::player::{
     Player, PlayerEvent, PlayerInput, PlayerStats, Rect, Start, VideoFormat, VideoOverlay, WaylandTarget,
 };
@@ -36,6 +38,8 @@ const HANDOVER_LEAD: Duration = Duration::from_millis(1500);
 const RETIRE_AFTER: Duration = Duration::from_millis(250);
 /// Close enough to the handover position to take over.
 const TOLERANCE: Duration = Duration::from_millis(30);
+/// How often progress goes into the site's watch history while playing.
+const HISTORY_EVERY: Duration = Duration::from_secs(30);
 /// Playback moving this much more or less than the clock says counts as a jump.
 const JUMP_THRESHOLD_SECONDS: f64 = 0.5;
 
@@ -168,6 +172,8 @@ pub struct PlaybackSession {
     /// When the window went out of sight, if it is.
     hidden_since: Option<Instant>,
     video_suspended: bool,
+    /// When progress last went into the watch history; `None` until the video first plays.
+    history_reported: Option<Instant>,
     _resolve: Option<Task<()>>,
     _alternates: Option<Task<()>>,
     _events: Option<Task<()>>,
@@ -202,6 +208,7 @@ impl PlaybackSession {
             jumps: JumpDetector::default(),
             hidden_since: None,
             video_suspended: false,
+            history_reported: None,
             _resolve: None,
             _alternates: None,
             _events: None,
@@ -384,6 +391,8 @@ impl PlaybackSession {
 
     /// Stop and forget the video.
     pub fn close(&mut self, cx: &mut Context<Self>) {
+        self.report_watching(Watching::Stopped(self.position.unwrap_or_default()));
+        self.history_reported = None;
         self._resolve = None;
         self.stop_player();
         self.video = None;
@@ -470,6 +479,9 @@ impl PlaybackSession {
             Seek::To(target) if self.duration.is_some_and(|duration| target > duration) => return,
             Seek::To(target) => target,
         };
+        if let Some(position) = self.position {
+            self.report_watching(Watching::Jumped(position, target));
+        }
         self.controlling(cx, |this| {
             let Some(player) = this.player.as_mut() else { return };
             player.seek(target);
@@ -659,6 +671,16 @@ impl PlaybackSession {
 
     // ── Internals ────────────────────────────────────────────────────────────
 
+    /// Into the site's watch history, once the video has started playing.
+    fn report_watching(&mut self, watching: Watching) {
+        let Some(video) = &self.video else { return };
+        let starting = matches!(watching, Watching::Started(_));
+        if self.history_reported.is_some() != starting {
+            self.backend.watching(video, watching);
+            self.history_reported = Some(Instant::now());
+        }
+    }
+
     fn fail(&mut self, error: String, cx: &mut Context<Self>) {
         self.status = Status::Error(error);
         cx.notify();
@@ -841,6 +863,14 @@ impl PlaybackSession {
             update(true);
         }
         update(self.note_video_suspended(suspended));
+        if self.status == Status::Playing {
+            let position = self.position.unwrap_or_default();
+            match self.history_reported {
+                None => self.report_watching(Watching::Started(position)),
+                Some(at) if at.elapsed() >= HISTORY_EVERY => self.report_watching(Watching::Progress(position)),
+                Some(_) => {}
+            }
+        }
         if changed {
             cx.notify();
         }

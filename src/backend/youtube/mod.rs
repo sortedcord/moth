@@ -13,6 +13,7 @@
 
 mod account;
 mod feed;
+mod history;
 mod visionos;
 mod ytdlp;
 
@@ -29,7 +30,7 @@ use rustypipe::model::{
 use super::accounts::Role;
 use super::media::{
     AlternateUrls, AudioCodec, AudioStream, AudioTrack, Channel, Link, Location, Published, StreamCatalog, StreamId,
-    VideoCodec, VideoDetails, VideoRef, VideoStream, VideoSummary,
+    VideoCodec, VideoDetails, VideoRef, VideoStream, VideoSummary, Watching,
 };
 use super::selection::StreamPreferences;
 use super::source::{BoxFuture, VideoSource};
@@ -85,6 +86,7 @@ pub struct YouTube {
     client: RustyPipe,
     /// Signed-in accounts, by role (see [`crate::backend::accounts`]).
     accounts: [Arc<account::Account>; 2],
+    history: Arc<history::History>,
     http: reqwest::Client,
     /// Dev override: start the resolver chain further down.
     first: Resolver,
@@ -103,7 +105,7 @@ impl YouTube {
             Arc::new(account::Account::load(Role::Playback).await?),
             Arc::new(account::Account::load(Role::Recommendations).await?),
         ];
-        Ok(Self { client, accounts, http, first, ytdlp_format })
+        Ok(Self { client, accounts, history: Default::default(), http, first, ytdlp_format })
     }
 
     pub fn account(&self, role: Role) -> Arc<account::Account> {
@@ -245,6 +247,25 @@ impl VideoSource for YouTube {
             match (catalog.video.into_iter().next(), catalog.audio.into_iter().next()) {
                 (Some(video), Some(audio)) => Ok(AlternateUrls { video: video.location, audio: audio.location }),
                 _ => bail!("yt-dlp returned no alternate URLs"),
+            }
+        }))
+    }
+
+    /// Into the recommendation account's history, if it's signed in.
+    fn watching(&self, id: String, watching: Watching) -> Option<BoxFuture<()>> {
+        let account = self.account(Role::Recommendations);
+        account.method()?;
+        let (history, http) = (self.history.clone(), self.http.clone());
+        Some(Box::pin(async move {
+            match watching {
+                Watching::Started(position) => history.started(&account, &http, &id, position).await,
+                Watching::Progress(position) => history.progress(&account, &http, &id, position).await,
+                Watching::Jumped(before, after) => history.jumped(&account, &http, &id, before, after).await,
+                Watching::Stopped(position) => {
+                    let result = history.progress(&account, &http, &id, position).await;
+                    history.stopped(&id);
+                    result
+                }
             }
         }))
     }

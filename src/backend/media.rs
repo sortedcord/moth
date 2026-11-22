@@ -225,6 +225,19 @@ pub struct StreamCatalog {
     pub has_alternates: bool,
 }
 
+/// Progress through a video, reported to its site (e.g. for a signed-in account's history).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Watching {
+    /// Playback began at this position.
+    Started(Duration),
+    /// Still watching, now here.
+    Progress(Duration),
+    /// Watched up to the first position, then sought to the second.
+    Jumped(Duration, Duration),
+    /// Left the video at this position.
+    Stopped(Duration),
+}
+
 /// A pair of streams to play.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection {

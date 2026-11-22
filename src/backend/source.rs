@@ -7,7 +7,9 @@ use std::pin::Pin;
 
 use anyhow::Result;
 
-use super::media::{AlternateUrls, AudioStream, Link, StreamCatalog, VideoDetails, VideoStream, VideoSummary};
+use super::media::{
+    AlternateUrls, AudioStream, Link, StreamCatalog, VideoDetails, VideoStream, VideoSummary, Watching,
+};
 use super::selection::StreamPreferences;
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'static>>;
@@ -55,6 +57,12 @@ pub trait VideoSource: Send + Sync {
     /// Videos to put on the home page right away (known without asking a server).
     fn featured(&self) -> Vec<VideoSummary> {
         Vec::new()
+    }
+
+    /// Tell the site how far a video has been watched, if it keeps a history (for a signed-in
+    /// account, say). Errors are only logged.
+    fn watching(&self, _id: String, _watching: Watching) -> Option<BoxFuture<()>> {
+        None
     }
 
     /// The site's recommendations for the home page, if it has any.

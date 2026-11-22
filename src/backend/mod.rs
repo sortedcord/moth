@@ -19,7 +19,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 
 use crate::dev::DevOptions;
 use accounts::{AccountInfo, DeviceCode, Role};
-use media::{AlternateUrls, Link, Selection, StreamCatalog, VideoDetails, VideoRef, VideoSummary};
+use media::{AlternateUrls, Link, Selection, StreamCatalog, VideoDetails, VideoRef, VideoSummary, Watching};
 use selection::StreamPreferences;
 use source::VideoSource;
 
@@ -160,6 +160,20 @@ impl Backend {
             }
             Ok(videos)
         })
+    }
+
+    /// Report progress through `video` to its site (history); failures are logged.
+    pub fn watching(&self, video: &VideoRef, watching: Watching) {
+        let Some(report) =
+            self.source(video.source).ok().and_then(|source| source.watching(video.id.clone(), watching))
+        else {
+            return;
+        };
+        self.runtime.spawn(async move {
+            if let Err(err) = report.await {
+                eprintln!("moth: couldn't update the watch history: {err:#}");
+            }
+        });
     }
 
     // ── Accounts ─────────────────────────────────────────────────────────────
