@@ -1,8 +1,10 @@
 //! YouTube Music: the music home's shelves, play queues ("up next", radio), and likes, through
 //! the web app's InnerTube client (`WEB_REMIX`, RustyPipe's `DesktopMusic`).
 //!
-//! The home is the recommendation account's when it's signed in with a browser session; YouTube
-//! Music refuses the TV app's token, so with a code sign-in (or none) it's the signed-out home.
+//! The home is the recommendation account's: YouTube Music's own with a browser session, or,
+//! since YouTube Music refuses the TV app's token, the TV app's music page (`FEtopics_music`:
+//! "Recently played", "Listen again", …) with a code sign-in. Signed out, it's YouTube Music's
+//! signed-out home.
 
 use std::time::Duration;
 
@@ -29,12 +31,58 @@ async fn request(query: &RustyPipeQuery, endpoint: &str, body: Value) -> Result<
     serde_json::from_str(&response).with_context(|| format!("unexpected {endpoint} response"))
 }
 
+/// Continuation pages of the TV app's music page to load (each adds a few shelves).
+const TV_PAGES: usize = 3;
+
 pub async fn home(account: &Account, signed_out: &RustyPipe) -> Result<Vec<MusicShelf>> {
+    if account.method() == Some(Method::DeviceCode)
+        && let Some((query, client)) = account.query()
+    {
+        return tv_home(&query, client).await;
+    }
     let query = music_query(account, signed_out);
     let response = request(&query, "browse", serde_json::json!({"browseId": "FEmusic_home"})).await?;
     let shelves = shelves(&response);
     if shelves.is_empty() {
         bail!("the music home is empty");
+    }
+    Ok(shelves)
+}
+
+/// The TV app's music page, and a few of its continuations.
+async fn tv_home(query: &RustyPipeQuery, client: ClientType) -> Result<Vec<MusicShelf>> {
+    let mut body = serde_json::json!({"browseId": "FEtopics_music"});
+    let mut shelves = Vec::new();
+    for _ in 0..=TV_PAGES {
+        let response = query.raw(client, "browse", &body).await?;
+        let response: Value = serde_json::from_str(&response).context("unexpected music page")?;
+        // Each shelf shows a few tiles and continues with more; fetch those alongside.
+        let page = tv_shelves(&response);
+        let more = page.iter().map(|(_, more)| async move {
+            let more = more.as_deref()?;
+            let response = query.raw(client, "browse", &serde_json::json!({"continuation": more})).await.ok()?;
+            let response: Value = serde_json::from_str(&response).ok()?;
+            let mut tiles = Vec::new();
+            find_all(&response, "tileRenderer", &mut tiles);
+            Some(tiles.into_iter().filter_map(tv_tile).collect::<Vec<_>>())
+        });
+        let more = futures::future::join_all(more).await;
+        for ((mut shelf, _), more) in page.into_iter().zip(more) {
+            shelf.items.extend(more.into_iter().flatten());
+            shelves.push(shelf);
+        }
+        // The page's own continuation is the section list's (each shelf has one of its own too).
+        let Some(more) = find_first(&response, "sectionListRenderer")
+            .or_else(|| find_first(&response, "sectionListContinuation"))
+            .and_then(|list| list.pointer("/continuations/0/nextContinuationData/continuation"))
+            .and_then(Value::as_str)
+        else {
+            break;
+        };
+        body = serde_json::json!({"continuation": more});
+    }
+    if shelves.is_empty() {
+        bail!("the music page is empty");
     }
     Ok(shelves)
 }
@@ -149,6 +197,73 @@ fn shelves(response: &Value) -> Vec<MusicShelf> {
             (!items.is_empty()).then_some(MusicShelf { title, layout, items })
         })
         .collect()
+}
+
+/// The TV app's shelves of tiles (videos, albums, playlists, artists), each with the
+/// continuation for more of its tiles.
+fn tv_shelves(response: &Value) -> Vec<(MusicShelf, Option<String>)> {
+    let mut found = Vec::new();
+    find_all(response, "shelfRenderer", &mut found);
+    found
+        .into_iter()
+        .filter_map(|shelf| {
+            let header = shelf.pointer("/headerRenderer/shelfHeaderRenderer")?;
+            let title = header
+                .pointer("/avatarLockup/avatarLockupRenderer/title")
+                .or_else(|| header.get("title"))
+                .and_then(text)?;
+            let mut tiles = Vec::new();
+            find_all(shelf.get("content")?, "tileRenderer", &mut tiles);
+            let items: Vec<MusicItem> = tiles.into_iter().filter_map(tv_tile).collect();
+            let more = shelf
+                .pointer("/content/horizontalListRenderer/continuations/0/nextContinuationData/continuation")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            (!items.is_empty()).then_some((MusicShelf { title, layout: ShelfLayout::Cards, items }, more))
+        })
+        .collect()
+}
+
+fn tv_tile(tile: &Value) -> Option<MusicItem> {
+    let metadata = tile.pointer("/metadata/tileMetadataRenderer")?;
+    let lines: Vec<String> = metadata
+        .get("lines")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .flat_map(|line| line.pointer("/lineRenderer/items").and_then(Value::as_array).into_iter().flatten())
+        .filter_map(|item| item.pointer("/lineItemRenderer/text").and_then(text))
+        .filter(|part| part.trim() != "•")
+        .collect();
+    let command = tile.get("onSelectCommand")?;
+    let (kind, play) = if let Some(watch) = command.get("watchEndpoint") {
+        let field = |name: &str| watch.get(name).and_then(Value::as_str).map(str::to_string);
+        // The TV app's radio ids (`RD<id>`) aren't YouTube Music's; the track's own radio is.
+        (MusicKind::Video, PlayTarget { source: super::ID, track: field("videoId"), playlist: None })
+    } else {
+        let browse = command.get("browseEndpoint")?;
+        let id = browse.get("browseId")?.as_str()?;
+        let kind = match find_first(browse, "pageType").and_then(Value::as_str) {
+            Some("MUSIC_PAGE_TYPE_ALBUM") => MusicKind::Album,
+            Some("MUSIC_PAGE_TYPE_ARTIST") => MusicKind::Artist,
+            _ if id.starts_with("UC") => MusicKind::Artist,
+            _ => MusicKind::Playlist,
+        };
+        // Artists have no queue of their own here.
+        let playlist = id.strip_prefix("VL").filter(|_| kind != MusicKind::Artist).map(str::to_string);
+        (kind, PlayTarget { source: super::ID, track: None, playlist })
+    };
+    let play = (play.track.is_some() || play.playlist.is_some()).then_some(play);
+    Some(MusicItem {
+        kind,
+        title: metadata.get("title").and_then(text)?,
+        subtitle: lines.join(" • "),
+        thumbnail_url: pick_thumbnail(
+            &thumbnails(tile.pointer("/header/tileHeaderRenderer/thumbnail/thumbnails")),
+            226,
+        ),
+        play,
+    })
 }
 
 /// What playing an item starts: its play button, else where clicking it goes, else its radio.
@@ -341,6 +456,36 @@ mod tests {
         assert_eq!((shelves[1].layout, song.kind), (ShelfLayout::List, MusicKind::Song));
         assert_eq!(song.subtitle, "Natalia Lafourcade • 12M plays");
         assert_eq!(song.play.as_ref().and_then(|play| play.track.as_deref()), Some("tdS3ijuqxW4"));
+    }
+
+    #[test]
+    fn reads_tv_music_shelves() {
+        let tile = |command: Value, kind: &str, title: &str| {
+            serde_json::json!({"tileRenderer": {"contentType": kind, "onSelectCommand": command,
+                "header": {"tileHeaderRenderer": {"thumbnail": {"thumbnails": [{"url": "https://t/320", "width": 320}]}}},
+                "metadata": {"tileMetadataRenderer": {"title": {"simpleText": title}, "lines": [
+                    {"lineRenderer": {"items": [{"lineItemRenderer": {"text": {"simpleText": "Mina Okabe"}}}]}},
+                    {"lineRenderer": {"items": [{"lineItemRenderer": {"text": {"simpleText": "Single"}}}]}}]}}}})
+        };
+        let response = serde_json::json!({"contents": {"sectionListRenderer": {"contents": [{"shelfRenderer": {
+            "headerRenderer": {"shelfHeaderRenderer": {"avatarLockup": {"avatarLockupRenderer": {
+                "title": {"runs": [{"text": "Listen again"}]}}}}},
+            "content": {"horizontalListRenderer": {"items": [
+                tile(serde_json::json!({"watchEndpoint": {"videoId": "r0joO1NE7I4", "playlistId": "RDr0joO1NE7I4"}}),
+                     "TILE_CONTENT_TYPE_VIDEO", "偽顔"),
+                tile(serde_json::json!({"browseEndpoint": {"browseId": "VLOLAK5uy_abc", "browseEndpointContextSupportedConfigs":
+                     {"browseEndpointContextMusicConfig": {"pageType": "MUSIC_PAGE_TYPE_ALBUM"}}}}),
+                     "TILE_CONTENT_TYPE_PLAYLIST", "Dancing Around The Truth")]}}}}]}}});
+        let shelves: Vec<MusicShelf> = tv_shelves(&response).into_iter().map(|(shelf, _)| shelf).collect();
+        assert_eq!(shelves.len(), 1);
+        assert_eq!(shelves[0].title, "Listen again");
+        let (song, album) = (&shelves[0].items[0], &shelves[0].items[1]);
+        assert_eq!(
+            song.play.as_ref().map(|play| (play.track.as_deref(), play.playlist.as_deref())),
+            Some((Some("r0joO1NE7I4"), None))
+        );
+        assert_eq!((album.kind, album.subtitle.as_str()), (MusicKind::Album, "Mina Okabe • Single"));
+        assert_eq!(album.play.as_ref().and_then(|play| play.playlist.as_deref()), Some("OLAK5uy_abc"));
     }
 
     #[test]

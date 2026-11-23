@@ -25,7 +25,8 @@ a browser extension that sends YouTube links to it.
 - **Fluid UI.** Layout changes animate on springs instead of jumping, rendered with Vulkan.
 - **Light on resources.** While the window is out of sight (another workspace, scrolled away, covered), moth
   stops downloading and decoding video and only plays the audio; the picture catches up when you look again.
-- **YouTube Music.** A Music tab with your YouTube Music home (signed out, the popular one), and a now-playing
+- **YouTube Music.** A Music tab with your YouTube Music home (with a code sign-in, the YouTube TV app's music
+  page, which has the same shelves; signed out, the popular one), and a now-playing
   bar on every page: queues from a song's radio or a playlist that keep going, previous/next, seeking, shuffle,
   repeat, like/dislike, and an expanded player with the queue and a Song/Video switch. Songs play as audio
   alone (no video downloaded or decoded) unless you pick Video. Audio quality is a setting (Low, Normal,
