@@ -2,6 +2,7 @@
 //! URLs for seeking (see [`super::YouTube::alternate_urls`]).
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, SystemTime};
 
@@ -100,17 +101,65 @@ impl Resolved {
     }
 }
 
-/// Resolve one video+audio pair. Blocking; run it on a blocking thread.
-pub fn resolve(video_id: &str, format: &str) -> Result<Resolved> {
+/// Resolve one video+audio pair, signed in with the session in `cookies` (a Netscape cookies
+/// file) if given. Blocking; run it on a blocking thread.
+pub fn resolve(video_id: &str, format: &str, cookies: Option<&Path>) -> Result<Resolved> {
     // yt-dlp may run alongside playback (for alternate URLs), so keep it out of the way.
-    let output = Command::new("nice")
-        .args(["-n", "10", "yt-dlp", "--no-warnings", "-f", format, "-j", "--", video_id])
-        .output()
-        .context("failed to run yt-dlp")?;
+    let mut command = Command::new("nice");
+    command.args(["-n", "10", "yt-dlp", "--no-warnings", "-f", format, "-j"]);
+    if let Some(cookies) = cookies {
+        command.arg("--cookies").arg(cookies);
+    }
+    let output = command.args(["--", video_id]).output().context("failed to run yt-dlp")?;
     if !output.status.success() {
         bail!("yt-dlp: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
     parse(&output.stdout)
+}
+
+/// A session's cookies as a Netscape cookies file for yt-dlp: private to the user, in the
+/// runtime directory, and deleted when dropped.
+pub struct CookieFile(std::path::PathBuf);
+
+impl CookieFile {
+    /// From a `Cookie` header value (`name=value; …`), for `.youtube.com`.
+    pub fn new(header: &str) -> Result<Self> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = crate::paths::runtime_dir().unwrap_or_else(std::env::temp_dir);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!("moth-cookies-{}-{n}.txt", std::process::id()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("couldn't create {}", path.display()))?;
+        let file_and_path = Self(path);
+        file.write_all(netscape_cookies(header).as_bytes())?;
+        Ok(file_and_path)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for CookieFile {
+    fn drop(&mut self) {
+        std::fs::remove_file(&self.0).ok();
+    }
+}
+
+/// `name=value; …` → Netscape cookie file lines for `.youtube.com`, valid for a year.
+fn netscape_cookies(header: &str) -> String {
+    let expires = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs() + 365 * 86_400;
+    let mut file = String::from("# Netscape HTTP Cookie File\n");
+    for (name, value) in header.split(';').filter_map(|pair| pair.trim().split_once('=')) {
+        file.push_str(&format!(".youtube.com\tTRUE\t/\tTRUE\t{expires}\t{name}\t{value}\n"));
+    }
+    file
 }
 
 /// Read what `yt-dlp -j` printed.
@@ -199,6 +248,16 @@ fn audio_stream(mut format: Format) -> Result<AudioStream> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writes_netscape_cookies() {
+        let file = netscape_cookies("SID=abc; __Secure-3PSID=d=e");
+        let lines: Vec<&str> = file.lines().collect();
+        assert_eq!(lines[0], "# Netscape HTTP Cookie File");
+        let fields: Vec<&str> = lines[2].split('\t').collect();
+        assert_eq!((fields[0], fields[5], fields[6]), (".youtube.com", "__Secure-3PSID", "d=e"));
+        assert_eq!(lines.len(), 3);
+    }
 
     #[test]
     fn format_groups_alternatives() {

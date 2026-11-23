@@ -31,6 +31,22 @@ const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWe
 
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// YouTube won't play the video to this client (signed out): it's age-restricted, members-only,
+/// private, wants proof the viewer isn't a bot, or doesn't exist.
+#[derive(Debug)]
+pub struct Refused {
+    pub status: String,
+    pub reason: Option<String>,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.status, self.reason.as_deref().unwrap_or("no reason given"))
+    }
+}
+
+impl std::error::Error for Refused {}
+
 /// What the visionOS client says about a video.
 pub enum Outcome {
     Streams(StreamCatalog),
@@ -188,9 +204,9 @@ impl Response {
         if self.video_details.as_ref().is_some_and(|details| details.is_live) {
             return Ok(Outcome::Live);
         }
-        let status = &self.playability_status;
+        let status = self.playability_status;
         if status.status != "OK" {
-            bail!("{}: {}", status.status, status.reason.as_deref().unwrap_or("no reason given"));
+            return Err(Refused { status: status.status, reason: status.reason }.into());
         }
         let formats = self.streaming_data.map(|data| data.adaptive_formats).unwrap_or_default();
         let mut video = Vec::new();

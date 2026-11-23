@@ -27,7 +27,7 @@ use rustypipe::model::{
     AudioCodec as RpAudioCodec, Thumbnail, UrlTarget, VideoCodec as RpVideoCodec, VideoItem, VideoPlayer,
 };
 
-use super::accounts::Role;
+use super::accounts::{Method, Role};
 use super::media::{
     AlternateUrls, AudioCodec, AudioStream, AudioTrack, Channel, Link, Location, Published, StreamCatalog, StreamId,
     VideoCodec, VideoDetails, VideoRef, VideoStream, VideoSummary, Watching,
@@ -113,6 +113,34 @@ impl YouTube {
     }
 }
 
+const SIGN_IN_HINT: &str = "This video needs you signed in: sign in a playback account with a browser \
+                            session in Settings → YouTube accounts.";
+
+/// Streams for a video YouTube only plays to a signed-in viewer, through the playback account
+/// (if it's signed in). That takes a browser session: yt-dlp signs in with its cookies. A code
+/// sign-in (the TV app) only gets SABR streams, which moth can't play yet (#11).
+async fn playback_streams(
+    account: &account::Account,
+    id: &str,
+    preferences: &StreamPreferences,
+    ytdlp_format: Option<String>,
+) -> Option<Result<StreamCatalog>> {
+    let result = match account.method()? {
+        Method::Cookies => {
+            let format = ytdlp_format.unwrap_or_else(|| ytdlp::format_for(preferences));
+            resolve_with_ytdlp(id.to_string(), format, account.cookie_header()).await.map(|mut catalog| {
+                catalog.resolver_detail = "yt-dlp (playback account)".to_string();
+                catalog
+            })
+        }
+        Method::DeviceCode => Err(anyhow!(
+            "a playback account signed in with a code can't play videos that need signing in yet; \
+             sign it in with a browser session instead"
+        )),
+    };
+    Some(result)
+}
+
 /// The recommendation account's home feed, if it's signed in.
 async fn signed_in_home(account: &account::Account) -> Option<Result<Vec<VideoSummary>>> {
     let (query, client) = account.query()?;
@@ -184,8 +212,11 @@ impl VideoSource for YouTube {
         let http = self.http.clone();
         let first = self.first;
         let ytdlp_format = self.ytdlp_format.clone();
+        let playback = self.account(Role::Playback);
         Box::pin(async move {
             let mut failures = Vec::new();
+            // YouTube wants a signed-in viewer (age-restricted, members-only, private, a bot check).
+            let mut needs_sign_in = false;
             if first <= Resolver::VisionOs {
                 match visionos::resolve(&http, &client, &id).await {
                     Ok(visionos::Outcome::Streams(mut catalog)) => {
@@ -194,9 +225,20 @@ impl VideoSource for YouTube {
                     }
                     Ok(visionos::Outcome::Live) => bail!(LIVE),
                     Err(err) => {
-                        eprintln!("moth: the visionOS client gave no streams, trying RustyPipe: {err:#}");
+                        needs_sign_in = err.downcast_ref::<visionos::Refused>().is_some();
+                        eprintln!("moth: the visionOS client gave no streams: {err:#}");
                         failures.push(format!("visionOS client: {err:#}"));
                     }
+                }
+            }
+            if needs_sign_in {
+                match playback_streams(&playback, &id, &preferences, ytdlp_format.clone()).await {
+                    Some(Ok(catalog)) => return Ok(catalog),
+                    Some(Err(err)) => {
+                        eprintln!("moth: the playback account couldn't play it either: {err:#}");
+                        failures.push(format!("playback account: {err:#}"));
+                    }
+                    None => {}
                 }
             }
             if first <= Resolver::RustyPipe {
@@ -216,7 +258,7 @@ impl VideoSource for YouTube {
                 failures.push(format!("RustyPipe: {error:#}"));
             }
             let format = ytdlp_format.unwrap_or_else(|| ytdlp::format_for(&preferences));
-            match resolve_with_ytdlp(id, format).await {
+            match resolve_with_ytdlp(id, format, None).await {
                 Ok(mut catalog) => {
                     if !failures.is_empty() {
                         catalog.resolver_detail = "yt-dlp (fallback)".to_string();
@@ -225,6 +267,9 @@ impl VideoSource for YouTube {
                 }
                 Err(error) => {
                     failures.push(format!("yt-dlp: {error:#}"));
+                    if needs_sign_in && playback.cookie_header().is_none() {
+                        failures.insert(0, SIGN_IN_HINT.to_string());
+                    }
                     bail!("{}", failures.join("\n"))
                 }
             }
@@ -243,7 +288,7 @@ impl VideoSource for YouTube {
         };
         let format = format!("{}+{audio_format}", itag(video.id));
         Some(Box::pin(async move {
-            let catalog = resolve_with_ytdlp(id, format).await?;
+            let catalog = resolve_with_ytdlp(id, format, None).await?;
             match (catalog.video.into_iter().next(), catalog.audio.into_iter().next()) {
                 (Some(video), Some(audio)) => Ok(AlternateUrls { video: video.location, audio: audio.location }),
                 _ => bail!("yt-dlp returned no alternate URLs"),
@@ -312,9 +357,14 @@ fn itag(id: StreamId) -> u64 {
     id.0 & 0xffff_ffff
 }
 
-/// Have yt-dlp resolve `format` of a video, and return its catalog once the URLs in it work.
-async fn resolve_with_ytdlp(id: String, format: String) -> Result<StreamCatalog> {
-    let resolved = tokio::task::spawn_blocking(move || ytdlp::resolve(&id, &format)).await??;
+/// Have yt-dlp resolve `format` of a video (signed in with a session's `Cookie` header, if
+/// given), and return its catalog once the URLs in it work.
+async fn resolve_with_ytdlp(id: String, format: String, cookies: Option<String>) -> Result<StreamCatalog> {
+    let resolved = tokio::task::spawn_blocking(move || {
+        let cookie_file = cookies.as_deref().map(ytdlp::CookieFile::new).transpose()?;
+        ytdlp::resolve(&id, &format, cookie_file.as_ref().map(ytdlp::CookieFile::path))
+    })
+    .await??;
     let wait = resolved.usable_in();
     if !wait.is_zero() {
         eprintln!("moth: YouTube serves yt-dlp's URLs in {:.1}s; holding them until then", wait.as_secs_f64());

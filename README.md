@@ -151,6 +151,12 @@ Metadata has the title, channel (`xesam:artist`), thumbnail, URL and length, plu
   URLs for the *same* files in the background, and the player switches to them when a seek needs it. yt-dlp is
   also the last resort. YouTube sometimes holds yt-dlp's URLs back for a few seconds (the slot of an ad before
   the video); moth waits that out, so on this path a far seek right after opening a video can take a while.
+- Videos YouTube only plays to a signed-in viewer (age-restricted, members-only) go through the playback
+  account: yt-dlp, signed in with its browser session's cookies (from a temporary private file). A playback
+  account signed in with a code can't play those yet: the TV app only gets SABR streams for them (#11), as
+  do Premium's higher-bitrate formats.
+- The recommendation account's home feed comes from the TV app (code sign-in) or the web (browser session);
+  while a video plays, moth reports progress to its watch history the way YouTube's apps do.
 
 **Playback.** A GStreamer pipeline: ranged `appsrc` → `decodebin3` → `waylandsink` for video and → `scaletempo`
 → `pulsesink` for audio. `waylandsink` shares gpui's Wayland connection and attaches a `wl_subsurface` to the
