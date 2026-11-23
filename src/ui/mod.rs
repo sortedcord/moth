@@ -85,13 +85,21 @@ pub fn run(
             window_min_size: Some(size(px(640.0), px(480.0))),
             ..Default::default()
         };
-        let opened = cx.open_window(options, |window, cx| cx.new(|cx| AppView::new(hub, commands, open, window, cx)));
-        if let Err(err) = opened {
-            eprintln!("moth: failed to open window: {err:#}");
-            cx.quit();
-            return;
-        }
-        cx.on_window_closed(|cx, _| quit(cx)).detach();
+        let window =
+            match cx.open_window(options, |window, cx| cx.new(|cx| AppView::new(hub, commands, open, window, cx))) {
+                Ok(window) => window,
+                Err(err) => {
+                    eprintln!("moth: failed to open window: {err:#}");
+                    cx.quit();
+                    return;
+                }
+            };
+        cx.on_window_closed(move |cx, id| {
+            if id == window.window_id() {
+                quit(cx);
+            }
+        })
+        .detach();
         cx.activate(true);
     });
 }
@@ -348,7 +356,7 @@ impl AppView {
 
         let show_stats = cx.global::<DevOptions>().player_stats.unwrap_or(cx.global::<Settings>().player_stats);
         let (session, images) = (self.session.clone(), self.images.clone());
-        let page = cx.new(|cx| WatchPage::new(video, session, images, show_stats, cx));
+        let page = cx.new(|cx| WatchPage::new(video, session, images, show_stats, window, cx));
         self._page_subscriptions = vec![
             cx.subscribe_in(&page, window, |this, _, event: &OpenVideo, window, cx| {
                 this.open_video(event.0.clone(), window, cx);

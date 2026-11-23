@@ -40,12 +40,7 @@ fn round_button(id: &'static str) -> gpui::Stateful<gpui::Div> {
         .justify_center()
 }
 
-pub fn render(
-    page: &WatchPage,
-    fullscreen: bool,
-    viewport_h: f32,
-    cx: &mut Context<WatchPage>,
-) -> impl IntoElement + use<> {
+pub fn render(page: &WatchPage, fullscreen: bool, cx: &mut Context<WatchPage>) -> impl IntoElement + use<> {
     let session = page.session.read(cx);
     let paused = matches!(session.status(), Status::Paused | Status::Ended);
     let position = session.position().unwrap_or_default();
@@ -113,10 +108,10 @@ pub fn render(
             round_button("player-settings")
                 .relative()
                 .when(menu_open, |button| button.bg(rgb(HOVER)))
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_menu(cx)))
+                .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.toggle_menu(window, cx)))
+                .when(menu_open, |button| button.on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx))))
                 .child(icon(Icon::Settings, 17.0, rgb(if menu_open { TEXT } else { MUTED }).into()))
-                .child(page.gear.element())
-                .when_some(page.menu_popover(fullscreen, viewport_h, cx), |button, menu| button.child(menu)),
+                .child(page.gear.element()),
         )
         .child(
             round_button("fullscreen")

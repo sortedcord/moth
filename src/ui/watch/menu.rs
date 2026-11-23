@@ -1,23 +1,25 @@
 //! The player settings popover (quality, format, audio track and quality, speed).
 
-use gpui::{
-    Anchor, Bounds, Context, FontWeight, MouseDownEvent, Pixels, anchored, deferred, div, point, prelude::*, px, rgb,
-    rgba,
-};
-
-use super::WatchPage;
 use crate::backend::media::{StreamId, quality_label};
 use crate::settings::{SPEEDS, Settings};
+use crate::ui::actions::{APP, Cancel};
 use crate::ui::format;
 use crate::ui::playback::PlaybackSession;
-use crate::ui::theme::{ACCENT, FAINT, HOVER, MUTED, TEXT, TRACK};
+use crate::ui::theme::{ACCENT, FAINT, FONT, HOVER, MUTED, TEXT, TRACK};
+use gpui::popup::{PopupAnchor, PopupConstraintAdjustment, PopupGravity, PopupOptions};
+use gpui::{
+    App, Bounds, Context, Entity, FocusHandle, FontWeight, Pixels, Size, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowDecorations, WindowHandle, WindowKind, WindowOptions, div, point, prelude::*, px, rgb, rgba,
+    size,
+};
 
-pub const MENU_W: f32 = 300.0;
-pub const ROW_H: f32 = 38.0;
-pub const HEADER_H: f32 = 44.0;
+const MENU_W: f32 = 300.0;
+const ROW_H: f32 = 38.0;
+const HEADER_H: f32 = 44.0;
+const GUTTERS: f32 = 18.0; // Vertical padding and border.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MenuPage {
+enum MenuPage {
     Main,
     Quality,
     Format,
@@ -40,7 +42,7 @@ impl MenuPage {
 }
 
 #[derive(Clone, Debug)]
-pub enum MenuAction {
+enum MenuAction {
     Open(MenuPage),
     /// `None` = automatic.
     Quality(Option<(u32, u8)>),
@@ -51,7 +53,7 @@ pub enum MenuAction {
 }
 
 impl MenuAction {
-    pub fn apply(self, session: &mut PlaybackSession, cx: &mut Context<PlaybackSession>) {
+    fn apply(self, session: &mut PlaybackSession, cx: &mut Context<PlaybackSession>) {
         match self {
             Self::Open(_) => {}
             Self::Quality(quality) => session.choose_quality(quality, cx),
@@ -63,7 +65,7 @@ impl MenuAction {
     }
 }
 
-pub struct MenuItem {
+struct MenuItem {
     label: String,
     detail: Option<String>,
     selected: bool,
@@ -74,7 +76,7 @@ fn item(label: impl Into<String>, detail: Option<String>, selected: bool, action
     MenuItem { label: label.into(), detail, selected, action }
 }
 
-pub fn items(page: MenuPage, session: &PlaybackSession, settings: &Settings) -> Vec<MenuItem> {
+fn items(page: MenuPage, session: &PlaybackSession, settings: &Settings) -> Vec<MenuItem> {
     let preferences = settings.stream_preferences();
     let catalog = session.catalog();
     let video = session.video_stream();
@@ -169,93 +171,151 @@ pub fn items(page: MenuPage, session: &PlaybackSession, settings: &Settings) -> 
     }
 }
 
-pub fn height(page: MenuPage, item_count: usize) -> f32 {
+fn menu_size(page: MenuPage, item_count: usize, max_height: Pixels) -> Size<Pixels> {
     let header = if page == MenuPage::Main { 0.0 } else { HEADER_H };
-    header + item_count as f32 * ROW_H + 16.0
+    size(px(MENU_W), px(header + item_count as f32 * ROW_H + GUTTERS).min(max_height))
 }
 
-/// The popover, attached to the gear button. In a window it opens downward (the video layer
-/// would hide anything drawn over the video); in fullscreen the video makes room for it above
-/// the control bar.
-pub fn render(
+/// Its own Wayland surface: GPUI elements in the main window can't cover the video subsurface.
+pub(super) struct SettingsPopup {
+    session: Entity<PlaybackSession>,
+    page: MenuPage,
+    focus: FocusHandle,
+    max_height: Pixels,
+    requested_size: Size<Pixels>,
+}
+
+impl SettingsPopup {
+    pub(super) fn open(
+        session: Entity<PlaybackSession>,
+        gear: Bounds<Pixels>,
+        parent: &Window,
+        cx: &mut App,
+    ) -> anyhow::Result<WindowHandle<Self>> {
+        let page = MenuPage::Main;
+        let max_height = (parent.viewport_size().height * 0.6).floor();
+        let requested_size = menu_size(page, items(page, session.read(cx), cx.global::<Settings>()).len(), max_height);
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(point(px(0.0), px(0.0)), requested_size))),
+                window_background: WindowBackgroundAppearance::Transparent,
+                window_decorations: Some(WindowDecorations::Server),
+                kind: WindowKind::AnchoredPopup(PopupOptions {
+                    parent: parent.window_handle(),
+                    anchor_rect: gear,
+                    anchor: PopupAnchor::TopRight,
+                    gravity: PopupGravity::TopLeft,
+                    // Shrink the scrollable list rather than flipping the menu below the video.
+                    constraint_adjustment: PopupConstraintAdjustment::SLIDE_X | PopupConstraintAdjustment::RESIZE_Y,
+                    offset: point(px(0.0), px(-8.0)),
+                    grab: true,
+                }),
+                ..Default::default()
+            },
+            |window, cx| {
+                cx.new(|cx| {
+                    let focus = cx.focus_handle();
+                    window.focus(&focus, cx);
+                    cx.observe_in(&session, window, |this: &mut Self, _, window, cx| this.update_size(window, cx))
+                        .detach();
+                    Self { session, page, focus, max_height, requested_size }
+                })
+            },
+        )
+    }
+
+    fn update_size(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let count = items(self.page, self.session.read(cx), cx.global::<Settings>()).len();
+        let size = menu_size(self.page, count, self.max_height);
+        if size != self.requested_size {
+            self.requested_size = size;
+            window.resize(size);
+        }
+        cx.notify();
+    }
+
+    fn menu_action(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
+        if let MenuAction::Open(page) = action {
+            self.page = page;
+            self.update_size(window, cx);
+        } else {
+            self.session.update(cx, |session, cx| action.apply(session, cx));
+            window.remove_window();
+        }
+    }
+}
+
+impl Render for SettingsPopup {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        render(self.page, items(self.page, self.session.read(cx), cx.global::<Settings>()), &self.focus, cx)
+    }
+}
+
+fn render(
     page: MenuPage,
     items: Vec<MenuItem>,
-    gear: Bounds<Pixels>,
-    viewport_h: f32,
-    fullscreen: bool,
-    cx: &mut Context<WatchPage>,
+    focus: &FocusHandle,
+    cx: &mut Context<SettingsPopup>,
 ) -> impl IntoElement + use<> {
-    let max_list_h = if fullscreen {
-        (viewport_h * 0.6 - HEADER_H).max(ROW_H * 3.0)
-    } else {
-        let below = viewport_h - f32::from(gear.bottom()) - 24.0;
-        (below - HEADER_H - 16.0).max(ROW_H * 3.0)
-    };
+    let rows = items.into_iter().enumerate().map(|(ix, entry)| {
+        let submenu = matches!(entry.action, MenuAction::Open(_));
+        let action = entry.action;
+        div()
+            .id(("menu-item", ix))
+            .h(px(ROW_H))
+            .flex_none()
+            .px_4()
+            .flex()
+            .items_center()
+            .gap_3()
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(HOVER)))
+            .on_click(cx.listener(move |this, _, window, cx| this.menu_action(action.clone(), window, cx)))
+            .when(page != MenuPage::Main, |row| {
+                row.child(div().w(px(14.0)).flex_none().text_sm().text_color(rgb(ACCENT)).child(if entry.selected {
+                    "✓"
+                } else {
+                    ""
+                }))
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_sm()
+                    .text_color(rgb(TEXT))
+                    .when(entry.selected, |label| label.font_weight(FontWeight::SEMIBOLD))
+                    .truncate()
+                    .child(entry.label),
+            )
+            .when_some(entry.detail, |row, detail| {
+                row.child(div().flex_none().text_xs().text_color(rgb(MUTED)).child(detail))
+            })
+            .when(submenu, |row| row.child(div().flex_none().text_sm().text_color(rgb(FAINT)).child("›")))
+    });
 
-    let rows: Vec<_> = items
-        .into_iter()
-        .enumerate()
-        .map(|(ix, entry)| {
-            let submenu = matches!(entry.action, MenuAction::Open(_));
-            let action = entry.action;
-            div()
-                .id(("menu-item", ix))
-                .h(px(ROW_H))
-                .flex_none()
-                .px_4()
-                .flex()
-                .items_center()
-                .gap_3()
-                .cursor_pointer()
-                .hover(|style| style.bg(rgb(HOVER)))
-                .on_click(cx.listener(move |this, _, _, cx| this.menu_action(action.clone(), cx)))
-                .when(page != MenuPage::Main, |row| {
-                    row.child(
-                        div().w(px(14.0)).flex_none().text_sm().text_color(rgb(ACCENT)).child(if entry.selected {
-                            "✓"
-                        } else {
-                            ""
-                        }),
-                    )
-                })
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_sm()
-                        .text_color(rgb(TEXT))
-                        .when(entry.selected, |label| label.font_weight(FontWeight::SEMIBOLD))
-                        .truncate()
-                        .child(entry.label),
-                )
-                .when_some(entry.detail, |row, detail| {
-                    row.child(div().flex_none().text_xs().text_color(rgb(MUTED)).child(detail))
-                })
-                .when(submenu, |row| row.child(div().flex_none().text_sm().text_color(rgb(FAINT)).child("›")))
-        })
-        .collect();
-
-    let menu = div()
+    div()
         .id("player-settings-menu")
-        .w(px(MENU_W))
+        .key_context(APP)
+        .track_focus(focus)
+        .on_action(|_: &Cancel, window, _| window.remove_window())
+        .size_full()
+        .flex()
+        .flex_col()
+        .font_family(FONT)
+        .text_color(rgb(TEXT))
         .py_2()
         .rounded_xl()
         .bg(rgba(0x141a2cf7))
         .border_1()
         .border_color(rgb(TRACK))
-        .shadow_lg()
-        .occlude()
-        .on_mouse_down_out(cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-            // Clicks on the gear toggle the menu themselves.
-            if !gear.contains(&event.position) {
-                this.close_menu(cx);
-            }
-        }))
+        .overflow_hidden()
         .when_some(page.title(), |menu, title| {
             menu.child(
                 div()
                     .id("menu-back")
                     .h(px(HEADER_H - 8.0))
+                    .flex_none()
                     .mb_2()
                     .px_4()
                     .flex()
@@ -265,17 +325,23 @@ pub fn render(
                     .border_b_1()
                     .border_color(rgb(TRACK))
                     .hover(|style| style.bg(rgb(HOVER)))
-                    .on_click(cx.listener(|this, _, _, cx| this.menu_action(MenuAction::Open(MenuPage::Main), cx)))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| {
+                            this.menu_action(MenuAction::Open(MenuPage::Main), window, cx)
+                        }),
+                    )
                     .child(div().text_color(rgb(MUTED)).child("‹"))
                     .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(title)),
             )
         })
-        .child(div().id("menu-rows").max_h(px(max_list_h)).overflow_y_scroll().flex().flex_col().children(rows));
-
-    let (corner, anchor, offset) = if fullscreen {
-        (Anchor::TopRight, Anchor::BottomRight, point(px(0.0), px(-8.0)))
-    } else {
-        (Anchor::BottomRight, Anchor::TopRight, point(px(0.0), px(8.0)))
-    };
-    deferred(anchored().attach(gear, corner).anchor(anchor).offset(offset).child(menu)).with_priority(1)
+        .child(
+            div()
+                .id(("menu-rows", page as usize))
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .children(rows),
+        )
 }

@@ -10,7 +10,10 @@ mod video;
 
 use std::sync::Arc;
 
-use gpui::{AnyElement, Context, Entity, EventEmitter, FocusHandle, Focusable, Task, Window, div, prelude::*, px, rgb};
+use gpui::{
+    AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Subscription, Task, Window, WindowHandle,
+    div, prelude::*, px, rgb,
+};
 
 use super::BackendHandle;
 use super::actions::{
@@ -23,7 +26,7 @@ use super::theme::{ACCENT, DEEP, PAD};
 use crate::backend::media::{VideoDetails, VideoRef};
 use crate::desktop::Seek;
 use crate::settings::Settings;
-use menu::{MenuAction, MenuPage};
+use menu::SettingsPopup;
 
 /// Below this window width the page stacks into a single column.
 const NARROW_W: f32 = 1000.0;
@@ -43,7 +46,9 @@ pub struct WatchPage {
     session: Entity<PlaybackSession>,
     images: Entity<ImageCache>,
     details: Details,
-    menu: Option<MenuPage>,
+    menu: Option<WindowHandle<SettingsPopup>>,
+    _menu_closed: Subscription,
+    _window_bounds: Subscription,
     gear: BoundsTracker,
     seek_bar: BoundsTracker,
     show_stats: bool,
@@ -65,6 +70,7 @@ impl WatchPage {
         session: Entity<PlaybackSession>,
         images: Entity<ImageCache>,
         show_stats: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let fetch = cx.global::<BackendHandle>().0.details(&video);
@@ -75,12 +81,32 @@ impl WatchPage {
         cx.observe(&session, |_, _, cx| cx.notify()).detach();
         cx.observe(&images, |_, _, cx| cx.notify()).detach();
         session.update(cx, |session, cx| session.set_collect_stats(show_stats, cx));
+        let weak = cx.weak_entity();
+        let menu_closed = cx.on_window_closed(move |cx, id| {
+            // Removing the popup can emit this event while the watch page is being updated.
+            let weak = weak.clone();
+            cx.defer(move |cx| {
+                weak.update(cx, |this, cx| {
+                    if this.menu.is_some_and(|menu| menu.window_id() == id) {
+                        this.menu = None;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            });
+        });
+        // The popup is anchored to a snapshot of the gear bounds. A resize (including a
+        // fullscreen transition) can move the gear, so dismiss rather than leave it adrift.
+        let window_bounds = cx.observe_window_bounds(window, |this, _, cx| this.close_menu(cx));
+        cx.on_release(|this, cx| this.remove_menu(cx)).detach();
         Self {
             video,
             session,
             images,
             details: Details::Loading,
             menu: None,
+            _menu_closed: menu_closed,
+            _window_bounds: window_bounds,
             gear: BoundsTracker::default(),
             seek_bar: BoundsTracker::default(),
             show_stats,
@@ -117,45 +143,31 @@ impl WatchPage {
         cx.notify();
     }
 
-    fn toggle_menu(&mut self, cx: &mut Context<Self>) {
-        self.menu = if self.menu.is_some() { None } else { Some(MenuPage::Main) };
-        cx.notify();
+    fn toggle_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.menu.is_some() {
+            self.close_menu(cx);
+        } else if let Some(gear) = self.gear.get() {
+            match SettingsPopup::open(self.session.clone(), gear, window, cx) {
+                Ok(menu) => {
+                    self.menu = Some(menu);
+                    cx.notify();
+                }
+                Err(err) => eprintln!("moth: failed to open player settings: {err:#}"),
+            }
+        }
     }
 
     fn close_menu(&mut self, cx: &mut Context<Self>) {
-        self.menu = None;
-        cx.notify();
-    }
-
-    fn menu_action(&mut self, action: MenuAction, cx: &mut Context<Self>) {
-        if let MenuAction::Open(page) = action {
-            self.menu = Some(page);
-        } else {
-            self.session.update(cx, |session, cx| action.apply(session, cx));
-            self.menu = None;
+        if self.menu.is_some() {
+            self.remove_menu(cx);
+            cx.notify();
         }
-        cx.notify();
     }
 
-    fn menu_items(&self, page: MenuPage, cx: &gpui::App) -> Vec<menu::MenuItem> {
-        menu::items(page, self.session.read(cx), cx.global::<Settings>())
-    }
-
-    fn menu_popover(
-        &self,
-        fullscreen: bool,
-        viewport_h: f32,
-        cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement + use<>> {
-        let page = self.menu?;
-        let gear = self.gear.get()?;
-        let items = self.menu_items(page, cx);
-        Some(menu::render(page, items, gear, viewport_h, fullscreen, cx))
-    }
-
-    /// Room the open menu needs, in fullscreen (where it can't overlap the video).
-    fn menu_height(&self, cx: &gpui::App) -> f32 {
-        self.menu.map_or(0.0, |page| menu::height(page, self.menu_items(page, cx).len()))
+    fn remove_menu(&mut self, cx: &mut App) {
+        if let Some(menu) = self.menu.take() {
+            menu.update(cx, |_, window, _| window.remove_window()).ok();
+        }
     }
 
     // ── Actions ──────────────────────────────────────────────────────────────
@@ -220,7 +232,7 @@ impl WatchPage {
             .flex_col()
             .gap_3()
             .child(div().flex().justify_center().child(video::surface(session.anchor(), &status, frame_w, frame_h, cx)))
-            .child(controls::render(self, false, viewport_h, cx))
+            .child(controls::render(self, false, cx))
             .when_some(playback_error(&status), |column, error| column.child(error))
             .when_some(stats, |column, panel| column.child(panel))
     }
@@ -256,11 +268,8 @@ impl WatchPage {
             .into_any_element()
     }
 
-    /// Video fills the screen above a slim control bar. (Controls can't overlay the video: the
-    /// video subsurface is stacked above the window.)
+    /// Video fills the screen above a slim control bar.
     fn fullscreen(&self, w: f32, h: f32, cx: &mut Context<Self>) -> AnyElement {
-        // An open menu gets its own space, since the video would cover it.
-        let menu_room = if self.menu.is_some() { (self.menu_height(cx) + 16.0).min(h * 0.6) } else { 0.0 };
         let session = self.session.read(cx);
         let status = session.status().clone();
         let anchor = session.anchor();
@@ -268,8 +277,7 @@ impl WatchPage {
             .size_full()
             .flex()
             .flex_col()
-            .child(video::surface(anchor, &status, w, (h - FULLSCREEN_BAR_H - menu_room).max(0.0), cx))
-            .when(menu_room > 0.0, |column| column.child(div().h(px(menu_room)).flex_none()))
+            .child(video::surface(anchor, &status, w, (h - FULLSCREEN_BAR_H).max(0.0), cx))
             .child(
                 div()
                     .h(px(FULLSCREEN_BAR_H))
@@ -278,7 +286,7 @@ impl WatchPage {
                     .flex()
                     .items_center()
                     .bg(rgb(DEEP))
-                    .child(div().flex_1().child(controls::render(self, true, h, cx)))
+                    .child(div().flex_1().child(controls::render(self, true, cx)))
                     .when_some(playback_error(&status), |bar, error| bar.child(error)),
             )
             .into_any_element()
