@@ -28,7 +28,8 @@ a browser extension that sends YouTube links to it.
 - **YouTube Music.** A Music tab with your YouTube Music home (signed out, the popular one), and a now-playing
   bar on every page: queues from a song's radio or a playlist that keep going, previous/next, seeking, shuffle,
   repeat, like/dislike, and an expanded player with the queue and a Song/Video switch. Songs play as audio
-  alone (no video downloaded or decoded) unless you pick Video.
+  alone (no video downloaded or decoded) unless you pick Video. Audio quality is a setting (Low, Normal,
+  High), and the expanded player can pick an exact stream for the current track.
 - **Accounts.** A recommendation account for your own home feed, and a playback account for videos that need
   you signed in, each signed in with a code at google.com/device or a browser session; kept in your keyring.
 - **Your defaults.** Preferred resolution and codecs, default speed, seek steps, animations and more are

@@ -362,6 +362,13 @@ impl PlaybackSession {
                 if audio_only {
                     selection.video = None;
                 }
+                // Music goes by the audio quality tier.
+                if this.music.is_some() {
+                    let quality = cx.global::<Settings>().music_audio_quality;
+                    if let Some(audio) = quality.pick(&catalog.audio_in_track(None, &preferences)) {
+                        selection.audio = audio.id;
+                    }
+                }
                 this.catalog = Some(catalog);
                 let start = (start.is_some() || this.rate != 1.0).then_some(Start {
                     position: start.unwrap_or_default(),

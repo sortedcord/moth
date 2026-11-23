@@ -2,6 +2,8 @@
 
 use std::cmp::Reverse;
 
+use serde::{Deserialize, Serialize};
+
 use super::media::{AudioCodec, AudioStream, AudioTrack, Selection, StreamCatalog, StreamId, VideoCodec, VideoStream};
 
 /// What "automatic" quality means. Built from the settings.
@@ -24,6 +26,46 @@ impl Default for StreamPreferences {
 impl StreamPreferences {
     fn codec_rank(&self, codec: VideoCodec) -> usize {
         self.video_codecs.iter().position(|preferred| *preferred == codec).unwrap_or(self.video_codecs.len())
+    }
+}
+
+/// How good music should sound, as YouTube Music puts it: a tier rather than a stream, since
+/// every track has its own streams.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AudioQuality {
+    /// The smallest stream (about 50 kbps): saves data.
+    Low,
+    /// About 128 kbps.
+    Normal,
+    /// The best there is.
+    #[default]
+    High,
+}
+
+impl AudioQuality {
+    pub const ALL: [Self; 3] = [Self::Low, Self::Normal, Self::High];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Normal => "Normal",
+            Self::High => "High",
+        }
+    }
+
+    /// From `streams` as [`StreamCatalog::audio_in_track`] orders them (preferred codec first,
+    /// best first), the one for this tier, staying with the preferred codec.
+    pub fn pick<'a>(self, streams: &[&'a AudioStream]) -> Option<&'a AudioStream> {
+        const NORMAL_BPS: i64 = 128_000;
+        let codec = streams.first()?.codec;
+        let bitrate = |stream: &&&AudioStream| i64::from(stream.bitrate.unwrap_or(0));
+        let same_codec = streams.iter().filter(|stream| stream.codec == codec);
+        match self {
+            Self::High => streams.first().copied(),
+            Self::Low => same_codec.min_by_key(bitrate).copied(),
+            Self::Normal => same_codec.min_by_key(|stream| (bitrate(stream) - NORMAL_BPS).abs()).copied(),
+        }
     }
 }
 
@@ -176,5 +218,30 @@ mod tests {
     #[test]
     fn qualities_are_distinct_and_descending() {
         assert_eq!(catalog().qualities(), vec![(1080, 60), (720, 60), (720, 30), (360, 30)]);
+    }
+    #[test]
+    fn audio_tiers_keep_the_codec() {
+        let audio = |id: u64, codec: AudioCodec, kbps: u32| AudioStream {
+            id: StreamId(id),
+            location: crate::backend::media::Location::new("x"),
+            codec,
+            bitrate: Some(kbps * 1000),
+            size: None,
+            track: None,
+        };
+        let streams = [
+            audio(251, AudioCodec::Opus, 135),
+            audio(250, AudioCodec::Opus, 70),
+            audio(249, AudioCodec::Opus, 50),
+            audio(140, AudioCodec::Aac, 129),
+            audio(139, AudioCodec::Aac, 48),
+        ];
+        let streams: Vec<&AudioStream> = streams.iter().collect();
+        let pick = |quality: AudioQuality| quality.pick(&streams).map(|stream| stream.id.0);
+        assert_eq!(
+            (pick(AudioQuality::High), pick(AudioQuality::Normal), pick(AudioQuality::Low)),
+            (Some(251), Some(251), Some(249))
+        );
+        assert_eq!(AudioQuality::Low.pick(&[]).map(|stream| stream.id), None);
     }
 }

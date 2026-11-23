@@ -238,12 +238,31 @@ pub fn expanded(
         queue.upcoming().take(60).map(|(place, track)| (place, track.clone())).collect();
     let art_size = (viewport_h - 260.0).clamp(220.0, 560.0);
     let aspect = state.aspect().unwrap_or(16.0 / 9.0);
+    // The current track's streams (in its audio track), to pick one for this track.
+    let preferences = cx.global::<crate::settings::Settings>().stream_preferences();
+    let state = session.read(cx);
+    let current_audio =
+        state.audio_stream().map(|audio| (audio.id, audio.track.as_ref().map(|track| track.id.clone())));
+    let streams: Vec<(crate::backend::media::StreamId, String)> = match (state.catalog(), &current_audio) {
+        (Some(catalog), Some((_, track))) => catalog
+            .audio_in_track(track.as_deref(), &preferences)
+            .into_iter()
+            .map(|audio| (audio.id, audio.label()))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let selected_audio = current_audio.map(|(id, _)| id);
     let image = current
         .artwork_url
         .as_deref()
         .and_then(|url| images.read(cx).get(url))
         .map(ImageSource::from)
         .or_else(|| track_image(&current, images, cx));
+
+    let audio_chips = chip_row().children(streams.into_iter().enumerate().map(|(ix, (id, label))| {
+        chip(("music-audio", ix), label, Some(id) == selected_audio)
+            .on_click(cx.listener(move |this, _, _, cx| this.session.update(cx, |s, cx| s.choose_audio(id, cx))))
+    }));
 
     let toggle = chip_row()
         .child(
@@ -326,15 +345,24 @@ pub fn expanded(
         .flex()
         .gap_8()
         .child(
-            div().flex_none().flex().flex_col().items_center().gap_4().child(toggle).child(stage).child(
-                div()
-                    .max_w(px(art_size.max(320.0)))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .child(line(current.title.clone()).text_xl().font_weight(FontWeight::BOLD))
-                    .child(line(current.artists.clone()).text_sm().text_color(rgb(MUTED))),
-            ),
+            div()
+                .flex_none()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_4()
+                .child(toggle)
+                .child(stage)
+                .child(
+                    div()
+                        .max_w(px(art_size.max(320.0)))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .child(line(current.title.clone()).text_xl().font_weight(FontWeight::BOLD))
+                        .child(line(current.artists.clone()).text_sm().text_color(rgb(MUTED))),
+                )
+                .child(audio_chips),
         )
         .child(
             div()

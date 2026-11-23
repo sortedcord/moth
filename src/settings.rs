@@ -9,7 +9,7 @@ use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::media::{AudioCodec, VideoCodec};
-use crate::backend::selection::StreamPreferences;
+use crate::backend::selection::{AudioQuality, StreamPreferences};
 
 /// Choices offered for the maximum resolution.
 pub const RESOLUTIONS: [u32; 5] = [360, 480, 720, 1080, 1440];
@@ -26,6 +26,8 @@ pub struct Settings {
     /// Video codecs in order of preference; unlisted ones come last.
     pub video_codecs: Vec<VideoCodec>,
     pub audio_codec: AudioCodec,
+    /// Music's audio quality, per track (the expanded player picks an exact stream for one).
+    pub music_audio_quality: AudioQuality,
     /// Speed new videos start at.
     pub default_rate: f64,
     /// Keep the speed from one video to the next (as YouTube does), instead of resetting it.
@@ -63,6 +65,7 @@ impl Default for Settings {
             max_height: streams.max_height,
             video_codecs: streams.video_codecs,
             audio_codec: streams.audio_codec,
+            music_audio_quality: AudioQuality::default(),
             default_rate: 1.0,
             remember_rate: true,
             seek_step: 5,

@@ -11,6 +11,7 @@ use super::text_input::TextInput;
 use super::theme::{ACCENT, BG_BOTTOM, FAINT, MUTED, PANEL, TEXT, TRACK};
 use crate::backend::accounts::{Method, Role};
 use crate::backend::media::{AudioCodec, VideoCodec};
+use crate::backend::selection::AudioQuality;
 use crate::settings::{Animations, RESOLUTIONS, SEEK_STEPS, SPEEDS, Settings};
 
 fn section(title: &'static str) -> gpui::Div {
@@ -221,6 +222,20 @@ pub fn render(
             switch("remember-rate", settings.remember_rate, |s| s.remember_rate = !s.remember_rate, cx),
         ));
 
+    let music = section("MUSIC").child(row(
+        "Audio quality",
+        "For each track: Low (about 50 kbps) saves data, Normal is about 128 kbps, High is the best there is. \
+         The expanded player can pick an exact stream for the current track.",
+        choice(
+            "music-audio-quality",
+            AudioQuality::ALL,
+            settings.music_audio_quality,
+            |quality| quality.name().into(),
+            |s, quality| s.music_audio_quality = quality,
+            cx,
+        ),
+    ));
+
     let seeking = section("SEEKING")
         .child(row(
             "Arrow keys",
@@ -313,6 +328,7 @@ pub fn render(
             .gap_6()
             .child(div().text_xl().font_weight(FontWeight::SEMIBOLD).child("Settings"))
             .child(playback)
+            .child(music)
             .child(accounts)
             .child(seeking)
             .child(interface)
