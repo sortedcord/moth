@@ -24,6 +24,17 @@ pub struct NowPlaying {
     pub rate: f64,
     pub stream: Option<StreamInfo>,
     pub fullscreen: bool,
+    /// Playing a music queue: what's around the current track.
+    pub queue: Option<QueueInfo>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct QueueInfo {
+    pub has_next: bool,
+    pub has_previous: bool,
+    pub shuffle: bool,
+    /// `off`, `all` or `one`.
+    pub repeat: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -31,6 +42,7 @@ pub struct NowPlaying {
 pub enum Page {
     None,
     Home,
+    Music,
     Watch,
     Settings,
 }
@@ -96,6 +108,7 @@ impl NowPlaying {
             rate: 1.0,
             stream: None,
             fullscreen: false,
+            queue: None,
         }
     }
 

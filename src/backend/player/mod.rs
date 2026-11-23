@@ -61,7 +61,8 @@ pub struct StreamInput {
 
 #[derive(Clone, Debug)]
 pub struct PlayerInput {
-    pub video: StreamInput,
+    /// `None` plays the audio alone (no video is fetched or decoded).
+    pub video: Option<StreamInput>,
     pub audio: StreamInput,
     /// Alternate URLs are being resolved and will arrive through [`Player::set_alternates`] (or
     /// [`Player::alternates_failed`]); until then a refused request waits for them.
@@ -73,10 +74,17 @@ pub struct PlayerInput {
 
 impl PlayerInput {
     pub fn new(catalog: &StreamCatalog, selection: Selection, alternates_pending: bool) -> Option<Self> {
-        let video = catalog.video_stream(selection.video)?;
+        let video = match selection.video {
+            Some(id) => Some(catalog.video_stream(id)?),
+            None => None,
+        };
         let audio = catalog.audio_stream(selection.audio)?;
         Some(Self {
-            video: StreamInput { location: video.location.clone(), size: video.size, bitrate: video.bitrate },
+            video: video.map(|video| StreamInput {
+                location: video.location.clone(),
+                size: video.size,
+                bitrate: video.bitrate,
+            }),
             audio: StreamInput { location: audio.location.clone(), size: audio.size, bitrate: audio.bitrate },
             alternates_pending,
             near_only: catalog.has_alternates,
@@ -145,12 +153,11 @@ impl VideoOverlay {
 /// it also keeps the first audible output from being at the wrong position.
 pub struct Player {
     pipeline: gst::Pipeline,
-    video_sink: gst::Element,
+    /// `None` when playing audio alone.
+    video: Option<VideoBranch>,
     audio_sink: gst::Element,
     volume: gst::Element,
-    video_queue: gst::Element,
     audio_queue: gst::Element,
-    video_src: gst::Element,
     audio_src: gst::Element,
     paused: bool,
     rate: f64,
@@ -160,7 +167,6 @@ pub struct Player {
     pending_position: Option<Duration>,
     /// Muted until the start seek lands, so a mid-video start doesn't blip the opening.
     unmute_on_async_done: bool,
-    video_endpoint: Arc<Mutex<Endpoint>>,
     audio_endpoint: Arc<Mutex<Endpoint>>,
     /// The audio has played to the end (until the next seek).
     audio_ended: Arc<AtomicBool>,
@@ -180,20 +186,12 @@ impl Player {
         let make = |name: &str| {
             gst::ElementFactory::make(name).build().with_context(|| format!("missing GStreamer element `{name}`"))
         };
-        let video_endpoint = Endpoint::new(input.video.location.clone(), input.alternates_pending);
         let audio_endpoint = Endpoint::new(input.audio.location.clone(), input.alternates_pending);
-
         let pipeline = gst::Pipeline::new();
-        let vsrc = http_source::add_to(
-            &pipeline,
-            http.clone(),
-            video_endpoint.clone(),
-            input.video.size,
-            input.video.bitrate,
-        )?;
-        let vdecode = make("decodebin3")?;
-        let vqueue = make("queue")?;
-        let vsink = make("waylandsink")?;
+        let video = match &input.video {
+            Some(video) => Some(VideoBranch::new(&pipeline, video, input.alternates_pending, target, rect, http)?),
+            None => None,
+        };
 
         let asrc = http_source::add_to(
             &pipeline,
@@ -220,37 +218,17 @@ impl Player {
         // pause length. pulsesink's clock stops while paused.
         let asink = make("pulsesink")?;
 
-        pipeline.add_many([
-            &vdecode,
-            &vqueue,
-            &vsink,
-            &adecode,
-            &aqueue,
-            &aconvert,
-            &volume,
-            &tempo,
-            &aconvert_out,
-            &aresample,
-            &asink,
-        ])?;
-        vsrc.link(&vdecode)?;
+        pipeline.add_many([&adecode, &aqueue, &aconvert, &volume, &tempo, &aconvert_out, &aresample, &asink])?;
         asrc.link(&adecode)?;
-        gst::Element::link_many([&vqueue, &vsink])?;
         gst::Element::link_many([&aqueue, &aconvert, &volume, &tempo, &aconvert_out, &aresample, &asink])?;
-        link_decoded_pad(&vdecode, &vqueue, "video_");
         link_decoded_pad(&adecode, &aqueue, "audio_");
 
-        // Share the window's Wayland connection and embed into its surface.
-        vsink.set_context(&target.display_context());
-        let overlay = vsink
-            .dynamic_cast_ref::<gst_video::VideoOverlay>()
-            .ok_or_else(|| anyhow!("waylandsink is not a VideoOverlay"))?;
-        // SAFETY: the surface outlives the player (see `WaylandTarget::new`).
-        unsafe { overlay.set_window_handle(target.surface_handle()) };
-        overlay.set_render_rectangle(rect.x, rect.y, rect.w, rect.h)?;
-
         let audio_ended = Arc::new(AtomicBool::new(false));
-        watch_audio_end(&asink, audio_ended.clone(), video_endpoint.clone(), vsink.clone());
+        watch_audio_end(
+            &asink,
+            audio_ended.clone(),
+            video.as_ref().map(|video| (video.endpoint.clone(), video.sink.clone())),
+        );
 
         let pending_position = start.map(|start| start.position).filter(|position| !position.is_zero());
         volume.set_property("mute", pending_position.is_some());
@@ -259,19 +237,16 @@ impl Player {
 
         let player = Self {
             pipeline,
-            video_sink: vsink,
+            video,
             audio_sink: asink,
             volume,
-            video_queue: vqueue,
             audio_queue: aqueue,
-            video_src: vsrc,
             audio_src: asrc,
             paused: start.is_some_and(|start| start.paused),
             rate: start.map_or(1.0, |start| start.rate),
             started: false,
             pending_position,
             unmute_on_async_done: false,
-            video_endpoint,
             audio_endpoint,
             audio_ended,
             near_only: input.near_only,
@@ -306,8 +281,13 @@ impl Player {
         }
     }
 
-    pub fn overlay(&self) -> VideoOverlay {
-        VideoOverlay(self.video_sink.clone())
+    /// Where the video is drawn; `None` when playing audio alone.
+    pub fn overlay(&self) -> Option<VideoOverlay> {
+        self.video.as_ref().map(|video| VideoOverlay(video.sink.clone()))
+    }
+
+    pub fn has_video(&self) -> bool {
+        self.video.is_some()
     }
 
     pub fn set_rate(&mut self, rate: f64) {
@@ -381,7 +361,8 @@ impl Player {
     /// near real time and there's no other to switch to: resuming jumps ahead like a seek, which
     /// that URL would refuse.
     pub fn set_video_suspended(&self, suspended: bool) -> bool {
-        let mut endpoint = lock(&self.video_endpoint);
+        let Some(video) = &self.video else { return false };
+        let mut endpoint = lock(&video.endpoint);
         let reaches = !self.near_only || endpoint.switched || !matches!(endpoint.alternate, Alternate::Unavailable);
         let suspended =
             suspended && endpoint.resumable && reaches && self.started && !self.audio_ended.load(Ordering::Acquire);
@@ -389,21 +370,28 @@ impl Player {
             return suspended;
         }
         endpoint.flow = if suspended { Flow::Suspended } else { Flow::Resume(self.position().unwrap_or_default()) };
-        set_waits_for_video(&self.video_sink, !suspended);
+        set_waits_for_video(&video.sink, !suspended);
         suspended
     }
 
     pub fn video_suspended(&self) -> bool {
-        lock(&self.video_endpoint).flow == Flow::Suspended
+        self.video.as_ref().is_some_and(|video| lock(&video.endpoint).flow == Flow::Suspended)
+    }
+
+    /// The video and audio endpoints (just audio when playing audio alone).
+    fn endpoints(&self) -> impl Iterator<Item = &Arc<Mutex<Endpoint>>> {
+        self.video.as_ref().map(|video| &video.endpoint).into_iter().chain([&self.audio_endpoint])
     }
 
     pub fn set_alternates(&self, urls: AlternateUrls) {
-        lock(&self.video_endpoint).alternate = Alternate::Ready(urls.video);
+        if let Some(video) = &self.video {
+            lock(&video.endpoint).alternate = Alternate::Ready(urls.video);
+        }
         lock(&self.audio_endpoint).alternate = Alternate::Ready(urls.audio);
     }
 
     pub fn alternates_failed(&self) {
-        for endpoint in [&self.video_endpoint, &self.audio_endpoint] {
+        for endpoint in self.endpoints() {
             let mut endpoint = lock(endpoint);
             if matches!(endpoint.alternate, Alternate::Pending) {
                 endpoint.alternate = Alternate::Unavailable;
@@ -413,11 +401,11 @@ impl Player {
 
     /// Whether either stream switched to its alternate URL.
     pub fn using_alternates(&self) -> bool {
-        lock(&self.video_endpoint).switched || lock(&self.audio_endpoint).switched
+        self.endpoints().any(|endpoint| lock(endpoint).switched)
     }
 
     pub fn video_format(&self) -> Option<VideoFormat> {
-        let caps = self.video_sink.static_pad("sink")?.current_caps()?;
+        let caps = self.video.as_ref()?.sink.static_pad("sink")?.current_caps()?;
         let structure = caps.structure(0)?;
         let width = structure.get::<i32>("width").ok()?;
         let height = structure.get::<i32>("height").ok()?;
@@ -457,22 +445,23 @@ impl Player {
         } else {
             format!("{current:?} → {pending:?}")
         };
-        let video_pts = stats::last_sample_pts(&self.video_sink);
+        let video_pts = self.video.as_ref().and_then(|video| stats::last_sample_pts(&video.sink));
         let audio_pts = stats::last_sample_pts(&self.audio_sink);
+        let video = self.video.as_ref();
         PlayerStats {
             clock: clock.map_or_else(|| "none".to_string(), |clock| clock.name().to_string()),
             state,
             position: self.position(),
             running,
             rate: self.rate,
-            video_caps: stats::pad_caps(&self.video_sink),
+            video_caps: video.and_then(|video| stats::pad_caps(&video.sink)),
             audio_caps: stats::pad_caps(&self.audio_sink),
-            video_sink: stats::sink_stats(&self.video_sink),
+            video_sink: video.map(|video| stats::sink_stats(&video.sink)),
             audio_sink: stats::sink_stats(&self.audio_sink),
-            video_queue: stats::queue_level(&self.video_queue),
+            video_queue: video.map(|video| stats::queue_level(&video.queue)),
             audio_queue: stats::queue_level(&self.audio_queue),
             av_offset_ms: video_pts.zip(audio_pts).map(|(v, a)| (v as f64 - a as f64) / 1e6),
-            video_net: stats::net_stats(&self.video_endpoint, &self.video_src),
+            video_net: video.map(|video| stats::net_stats(&video.endpoint, &video.src)),
             audio_net: stats::net_stats(&self.audio_endpoint, &self.audio_src),
             video_suspended: self.video_suspended(),
         }
@@ -482,10 +471,53 @@ impl Player {
 impl Drop for Player {
     fn drop(&mut self) {
         // Whatever the sources' threads are still waiting for, they needn't any more.
-        for endpoint in [&self.video_endpoint, &self.audio_endpoint] {
+        for endpoint in self.endpoints() {
             lock(endpoint).closed = true;
         }
         self.pipeline.set_state(gst::State::Null).ok();
+    }
+}
+
+/// The video half of the pipeline: ranged source → decodebin3 → queue → waylandsink, drawing
+/// into the window's surface.
+struct VideoBranch {
+    sink: gst::Element,
+    queue: gst::Element,
+    src: gst::Element,
+    endpoint: Arc<Mutex<Endpoint>>,
+}
+
+impl VideoBranch {
+    fn new(
+        pipeline: &gst::Pipeline,
+        input: &StreamInput,
+        alternates_pending: bool,
+        target: &WaylandTarget,
+        rect: Rect,
+        http: &Http,
+    ) -> Result<Self> {
+        let make = |name: &str| {
+            gst::ElementFactory::make(name).build().with_context(|| format!("missing GStreamer element `{name}`"))
+        };
+        let endpoint = Endpoint::new(input.location.clone(), alternates_pending);
+        let src = http_source::add_to(pipeline, http.clone(), endpoint.clone(), input.size, input.bitrate)?;
+        let decode = make("decodebin3")?;
+        let queue = make("queue")?;
+        let sink = make("waylandsink")?;
+        pipeline.add_many([&decode, &queue, &sink])?;
+        src.link(&decode)?;
+        gst::Element::link_many([&queue, &sink])?;
+        link_decoded_pad(&decode, &queue, "video_");
+
+        // Share the window's Wayland connection and embed into its surface.
+        sink.set_context(&target.display_context());
+        let overlay = sink
+            .dynamic_cast_ref::<gst_video::VideoOverlay>()
+            .ok_or_else(|| anyhow!("waylandsink is not a VideoOverlay"))?;
+        // SAFETY: the surface outlives the player (see `WaylandTarget::new`).
+        unsafe { overlay.set_window_handle(target.surface_handle()) };
+        overlay.set_render_rectangle(rect.x, rect.y, rect.w, rect.h)?;
+        Ok(Self { sink, queue, src, endpoint })
     }
 }
 
@@ -541,8 +573,7 @@ fn set_waits_for_video(video_sink: &gst::Element, wait: bool) {
 fn watch_audio_end(
     audio_sink: &gst::Element,
     ended: Arc<AtomicBool>,
-    video: Arc<Mutex<Endpoint>>,
-    video_sink: gst::Element,
+    video: Option<(Arc<Mutex<Endpoint>>, gst::Element)>,
 ) {
     let Some(pad) = audio_sink.static_pad("sink") else { return };
     pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM | gst::PadProbeType::EVENT_FLUSH, move |_, info| {
@@ -550,10 +581,12 @@ fn watch_audio_end(
             Some(gst::EventType::FlushStop) => ended.store(false, Ordering::Release),
             Some(gst::EventType::Eos) => {
                 ended.store(true, Ordering::Release);
-                let mut video = lock(&video);
-                if video.flow == Flow::Suspended {
-                    video.flow = Flow::Resume(Duration::MAX);
-                    set_waits_for_video(&video_sink, true);
+                if let Some((endpoint, sink)) = &video {
+                    let mut endpoint = lock(endpoint);
+                    if endpoint.flow == Flow::Suspended {
+                        endpoint.flow = Flow::Resume(Duration::MAX);
+                        set_waits_for_video(sink, true);
+                    }
                 }
             }
             _ => {}

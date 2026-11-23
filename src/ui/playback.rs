@@ -14,6 +14,7 @@ use futures::StreamExt as _;
 use gpui::{App, Context, Task};
 
 use super::BackendHandle;
+use super::music::MusicQueue;
 use crate::backend::Backend;
 use crate::backend::media::{
     AudioStream, Selection, StreamCatalog, StreamId, VideoCodec, VideoRef, VideoStream, Watching,
@@ -85,16 +86,17 @@ impl VideoAnchor {
         }
     }
 
-    fn attach(&self, overlay: VideoOverlay) {
-        *self.overlay.borrow_mut() = Some(overlay);
+    /// Draw the player's video here (`None` for a player without video).
+    fn attach(&self, overlay: Option<VideoOverlay>) {
+        *self.overlay.borrow_mut() = overlay;
     }
 
     /// Show another player's video in place of the current one's.
-    fn replace(&self, overlay: VideoOverlay) {
-        if let Some(rect) = self.rect.get() {
+    fn replace(&self, overlay: Option<VideoOverlay>) {
+        if let (Some(rect), Some(overlay)) = (self.rect.get(), &overlay) {
             overlay.set_rect(rect);
         }
-        *self.overlay.borrow_mut() = Some(overlay);
+        *self.overlay.borrow_mut() = overlay;
     }
 
     fn detach(&self) {
@@ -144,11 +146,14 @@ struct Handover {
 }
 
 pub struct PlaybackSession {
-    backend: Arc<Backend>,
+    pub(super) backend: Arc<Backend>,
     target: Result<WaylandTarget, String>,
     anchor: Rc<VideoAnchor>,
     video: Option<VideoRef>,
-    status: Status,
+    pub(super) status: Status,
+    /// Playing music: the queue (see `music.rs`).
+    pub(super) music: Option<MusicQueue>,
+    pub(super) _music: Option<Task<()>>,
     catalog: Option<Arc<StreamCatalog>>,
     selection: Option<Selection>,
     quality_auto: bool,
@@ -189,6 +194,8 @@ impl PlaybackSession {
             anchor: Rc::default(),
             video: None,
             status: Status::Idle,
+            music: None,
+            _music: None,
             catalog: None,
             selection: None,
             quality_auto: true,
@@ -217,6 +224,11 @@ impl PlaybackSession {
     }
 
     // ── Reading ──────────────────────────────────────────────────────────────
+
+    /// Whether the current player shows video (music plays audio alone).
+    pub fn has_video(&self) -> bool {
+        self.player.as_ref().is_some_and(Player::has_video)
+    }
 
     pub fn status(&self) -> &Status {
         &self.status
@@ -255,7 +267,7 @@ impl PlaybackSession {
     }
 
     pub fn video_stream(&self) -> Option<&VideoStream> {
-        self.catalog()?.video_stream(self.selection?.video)
+        self.catalog()?.video_stream(self.selection?.video?)
     }
 
     pub fn audio_stream(&self) -> Option<&AudioStream> {
@@ -319,8 +331,16 @@ impl PlaybackSession {
     // ── Controlling ──────────────────────────────────────────────────────────
 
     /// Start playing `video`, from `start` if given.
+    /// Watch a video (leaving any music queue).
     pub fn open(&mut self, video: VideoRef, start: Option<Duration>, cx: &mut Context<Self>) {
-        self.close(cx);
+        self.music = None;
+        self._music = None;
+        self.load(video, start, false, cx);
+    }
+
+    /// Play `video`, from `start`; `audio_only` fetches and decodes no video.
+    pub(super) fn load(&mut self, video: VideoRef, start: Option<Duration>, audio_only: bool, cx: &mut Context<Self>) {
+        self.unload(cx);
         let settings = cx.global::<Settings>();
         if !settings.remember_rate {
             self.rate = settings.default_rate;
@@ -336,9 +356,12 @@ impl PlaybackSession {
                     Ok(catalog) => Arc::new(catalog),
                     Err(err) => return this.fail(format!("{err:#}"), cx),
                 };
-                let Some(selection) = catalog.auto_selection(&preferences) else {
+                let Some(mut selection) = catalog.auto_selection(&preferences) else {
                     return this.fail("no playable streams".into(), cx);
                 };
+                if audio_only {
+                    selection.video = None;
+                }
                 this.catalog = Some(catalog);
                 let start = (start.is_some() || this.rate != 1.0).then_some(Start {
                     position: start.unwrap_or_default(),
@@ -391,6 +414,26 @@ impl PlaybackSession {
 
     /// Stop and forget the video.
     pub fn close(&mut self, cx: &mut Context<Self>) {
+        self.music = None;
+        self._music = None;
+        self.unload(cx);
+    }
+
+    /// Play the current video with or without its video stream, from where it is.
+    pub(super) fn set_audio_only(&mut self, audio_only: bool, cx: &mut Context<Self>) {
+        let (Some(catalog), Some(selection)) = (self.catalog.clone(), self.selection) else { return };
+        let video = if audio_only {
+            None
+        } else {
+            let preferences = cx.global::<Settings>().stream_preferences();
+            catalog.auto_video(&preferences, None).map(|video| video.id)
+        };
+        self.switch_to(Selection { video, ..selection }, cx);
+        cx.notify();
+    }
+
+    /// Stop the current video (the music queue, if any, stays).
+    fn unload(&mut self, cx: &mut Context<Self>) {
         self.report_watching(Watching::Stopped(self.position.unwrap_or_default()));
         self.history_reported = None;
         self._resolve = None;
@@ -519,14 +562,14 @@ impl PlaybackSession {
         };
         self.quality_auto = quality.is_none();
         if let Some(video) = video {
-            self.switch_to(Selection { video: video.id, ..selection }, cx);
+            self.switch_to(Selection { video: Some(video.id), ..selection }, cx);
         }
         cx.notify();
     }
 
     pub fn choose_video(&mut self, id: StreamId, cx: &mut Context<Self>) {
         if let Some(selection) = self.selection {
-            self.switch_to(Selection { video: id, ..selection }, cx);
+            self.switch_to(Selection { video: Some(id), ..selection }, cx);
         }
     }
 
@@ -760,7 +803,7 @@ impl PlaybackSession {
         self.format = None;
         self.jumps.previous = None;
         self.video_suspended = false;
-        if let Some(stream) = catalog.video_stream(selection.video)
+        if let Some(stream) = selection.video.and_then(|video| catalog.video_stream(video))
             && stream.width > 0
             && stream.height > 0
         {
@@ -811,6 +854,9 @@ impl PlaybackSession {
         }
         let Some(player) = self.player.as_mut() else { return };
         player.handle(&event);
+        if event == PlayerEvent::Eos && self.music.is_some() {
+            return self.track_ended(cx);
+        }
         if event == PlayerEvent::Paused && self.handover.as_ref().is_some_and(|handover| handover.stalled) {
             // Held for the handover, not paused by anyone.
             return;

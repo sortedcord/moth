@@ -2,6 +2,7 @@
 //! state (details, menu, scroll) starts fresh each time.
 
 mod controls;
+pub use controls::BoundsTracker;
 mod details;
 mod menu;
 mod stats_panel;
@@ -22,7 +23,6 @@ use super::theme::{ACCENT, DEEP, PAD};
 use crate::backend::media::{VideoDetails, VideoRef};
 use crate::desktop::Seek;
 use crate::settings::Settings;
-use controls::BoundsTracker;
 use menu::{MenuAction, MenuPage};
 
 /// Below this window width the page stacks into a single column.

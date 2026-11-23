@@ -12,6 +12,9 @@ mod home;
 mod icons;
 mod images;
 mod layout;
+mod music;
+mod music_page;
+mod now_playing;
 mod playback;
 mod presence;
 mod settings_page;
@@ -33,8 +36,9 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, Raw
 
 use crate::backend::Backend;
 use crate::backend::media::{Link, VideoRef, VideoSummary};
+use crate::backend::music::PlayTarget;
 use crate::backend::player::WaylandTarget;
-use crate::desktop::status::{Hub, NowPlaying, Page, VideoInfo};
+use crate::desktop::status::{Hub, NowPlaying, Page, QueueInfo, VideoInfo};
 use crate::desktop::{Command, socket};
 use crate::dev::DevOptions;
 use crate::settings::Settings;
@@ -121,6 +125,9 @@ pub enum FeedStatus {
 
 enum Route {
     Home,
+    Music,
+    /// The expanded music player.
+    Player,
     Watch(Entity<WatchPage>),
     Settings,
 }
@@ -139,6 +146,11 @@ pub struct AppView {
     feed: Vec<VideoSummary>,
     /// Recommendations still loading, or why they failed.
     feed_status: FeedStatus,
+    music_home: Option<music_page::MusicHome>,
+    /// Where closing the expanded player goes back to.
+    before_player: Option<Route>,
+    music_seek: watch::BoundsTracker,
+    _music_home: Option<Task<()>>,
     /// `MOTH_OPEN=<card index>` past the cards known at startup: opened once the feed is in.
     open_card: Option<usize>,
     focus: FocusHandle,
@@ -200,6 +212,7 @@ impl AppView {
                 }
             }),
             cx.observe_in(&session, window, |this, _, window, cx| {
+                this.load_queue_images(cx);
                 this.publish(window, cx);
                 this.update_presence(window, cx);
                 cx.notify();
@@ -232,6 +245,10 @@ impl AppView {
             layout: HomeLayout::new(dev.cards.unwrap_or(feed.len())),
             feed,
             feed_status: FeedStatus::Loading,
+            music_home: None,
+            before_player: None,
+            music_seek: Default::default(),
+            _music_home: None,
             open_card: None,
             focus,
             hub,
@@ -345,8 +362,12 @@ impl AppView {
         cx.notify();
     }
 
+    /// Leaving a video's watch page stops the video; music plays on wherever you go.
     fn leave_watch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.session.update(cx, |session, cx| session.close(cx));
+        self.leave_player(cx);
+        if matches!(self.route, Route::Watch(_)) {
+            self.session.update(cx, |session, cx| session.close(cx));
+        }
         self._page_subscriptions.clear();
         self.address.update(cx, |input, cx| input.set_text("", window, cx));
         window.focus(&self.focus, cx);
@@ -357,6 +378,73 @@ impl AppView {
         self.route = Route::Home;
         self.publish(window, cx);
         cx.notify();
+    }
+
+    fn open_music(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_watch(window, cx);
+        self.leave_player(cx);
+        self.route = Route::Music;
+        if !matches!(self.music_home, Some(music_page::MusicHome::Loaded(_))) {
+            self.load_music_home(window, cx);
+        }
+        self.publish(window, cx);
+        cx.notify();
+    }
+
+    fn load_music_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.music_home = Some(music_page::MusicHome::Loading);
+        let home = cx.global::<BackendHandle>().0.music_home();
+        self._music_home = Some(cx.spawn_in(window, async move |this, cx| {
+            let result = home.await;
+            this.update(cx, |this, cx| {
+                this.music_home = Some(match result {
+                    Ok(shelves) => {
+                        let urls: Vec<String> = shelves
+                            .iter()
+                            .flat_map(|shelf| &shelf.items)
+                            .filter_map(|item| item.thumbnail_url.clone())
+                            .collect();
+                        this.images.update(cx, |images, cx| urls.into_iter().for_each(|url| images.load(url, cx)));
+                        music_page::MusicHome::Loaded(shelves)
+                    }
+                    Err(err) => music_page::MusicHome::Failed(format!("{err:#}").into()),
+                });
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// The music home is someone else's now: load it again (now if it's showing, else when
+    /// the music page opens).
+    fn music_home_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.music_home = None;
+        if matches!(self.route, Route::Music) {
+            self.load_music_home(window, cx);
+        }
+    }
+
+    /// The music queue's thumbnails (and the current track's artwork). The cache only fetches
+    /// what it doesn't have, so this is cheap to repeat.
+    fn load_queue_images(&mut self, cx: &mut Context<Self>) {
+        let Some(queue) = self.session.read(cx).music() else { return };
+        let mut urls: Vec<String> = queue.tracks.iter().filter_map(|track| track.thumbnail_url.clone()).collect();
+        urls.extend(queue.current().and_then(|track| track.artwork_url.clone()));
+        self.images.update(cx, |images, cx| urls.into_iter().for_each(|url| images.load(url, cx)));
+    }
+
+    /// Start a music queue (a song's radio, a playlist, an album).
+    fn play_music(&mut self, target: PlayTarget, window: &mut Window, cx: &mut Context<Self>) {
+        self.session.update(cx, |session, cx| session.play_music(target, cx));
+        self.publish(window, cx);
+    }
+
+    /// Leaving the expanded player: its video stops showing.
+    fn leave_player(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.route, Route::Player) {
+            self.before_player = None;
+            self.session.update(cx, |session, cx| session.set_music_visible(false, cx));
+        }
     }
 
     fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -403,6 +491,8 @@ impl AppView {
             Command::Raise => window.activate_window(),
             // Quitting this way skips the window-closed hook.
             Command::Quit => quit(cx),
+            Command::Next => session.update(cx, |session, cx| session.next(cx)),
+            Command::Previous => session.update(cx, |session, cx| session.previous(cx)),
             Command::SignIn { role, cookies } => {
                 window.activate_window();
                 self.open_settings(window, cx);
@@ -446,21 +536,44 @@ impl AppView {
             Route::Watch(page) => Some(page.read(cx)),
             _ => None,
         };
-        let video = watching.map(|page| {
-            let details = page.details();
-            VideoInfo {
-                source: page.video().source,
-                id: page.video().id.clone(),
-                url: backend.web_url(page.video()),
-                title: details.map(|details| details.title.clone()),
-                channel: details.map(|details| details.channel.name.clone()),
-                thumbnail: backend.thumbnail_url(page.video()),
-            }
+        let track = session.music().and_then(|queue| queue.current());
+        let video = watching
+            .map(|page| {
+                let details = page.details();
+                VideoInfo {
+                    source: page.video().source,
+                    id: page.video().id.clone(),
+                    url: backend.web_url(page.video()),
+                    title: details.map(|details| details.title.clone()),
+                    channel: details.map(|details| details.channel.name.clone()),
+                    thumbnail: backend.thumbnail_url(page.video()),
+                }
+            })
+            .or_else(|| {
+                track.map(|track| VideoInfo {
+                    source: track.video.source,
+                    id: track.video.id.clone(),
+                    url: backend.web_url(&track.video),
+                    title: Some(track.title.clone()),
+                    channel: Some(track.artists.clone()),
+                    thumbnail: track.thumbnail_url.clone().or_else(|| backend.thumbnail_url(&track.video)),
+                })
+            });
+        let queue = session.music().map(|queue| QueueInfo {
+            has_next: queue.has_next(),
+            has_previous: queue.has_previous(),
+            shuffle: queue.shuffle,
+            repeat: match queue.repeat {
+                music::Repeat::Off => "off",
+                music::Repeat::All => "all",
+                music::Repeat::One => "one",
+            },
         });
         NowPlaying {
             running: true,
             page: match self.route {
                 Route::Home => Page::Home,
+                Route::Music | Route::Player => Page::Music,
                 Route::Watch(_) => Page::Watch,
                 Route::Settings => Page::Settings,
             },
@@ -472,6 +585,7 @@ impl AppView {
             video,
             rate: session.rate(),
             fullscreen: window.is_fullscreen(),
+            queue,
         }
     }
 
@@ -591,12 +705,29 @@ impl Render for AppView {
                 .gap_4()
                 .child(self.top_bar(true, address_focused, cx))
                 .child(page.clone()),
-            Route::Home | Route::Settings => {
+            Route::Home | Route::Settings | Route::Music | Route::Player => {
                 let animate = cx.global::<Settings>().animations_enabled(cx.reduce_motion());
                 if self.layout.step(viewport_w, animate) {
                     window.request_animation_frame();
                 }
                 let (entry, content) = match self.route {
+                    Route::Music => (
+                        sidebar::Entry::Music,
+                        match &self.music_home {
+                            Some(home) => music_page::render(home, &self.images, cx).into_any_element(),
+                            None => div().into_any_element(),
+                        },
+                    ),
+                    Route::Player => (
+                        sidebar::Entry::Music,
+                        now_playing::expanded(
+                            &self.session,
+                            self.session.read(cx).anchor(),
+                            &self.images,
+                            viewport_h,
+                            cx,
+                        ),
+                    ),
                     Route::Settings => {
                         let settings = cx.global::<Settings>().clone();
                         let error = self.settings_error.clone();
@@ -629,6 +760,10 @@ impl Render for AppView {
                     )
             }
         };
+        let expanded = matches!(self.route, Route::Player);
+        let bar = now_playing::bar(&self.session, &self.images, &self.music_seek, expanded, cx);
+        let body =
+            div().size_full().flex().flex_col().gap(px(PAD)).child(div().flex_1().min_h_0().child(body)).children(bar);
 
         self.root(cx)
             .p(px(PAD))

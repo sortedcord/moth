@@ -241,7 +241,8 @@ pub enum Watching {
 /// A pair of streams to play.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection {
-    pub video: StreamId,
+    /// `None` plays the audio alone.
+    pub video: Option<StreamId>,
     pub audio: StreamId,
 }
 

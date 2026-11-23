@@ -8,6 +8,16 @@ use super::theme::TEXT;
 pub enum Icon {
     Home,
     Settings,
+    Music,
+    Previous,
+    Next,
+    Shuffle,
+    Repeat,
+    RepeatOne,
+    ThumbUp,
+    ThumbDown,
+    ChevronUp,
+    ChevronDown,
 }
 
 /// Line icons drawn on a 24×24 grid.
@@ -45,6 +55,69 @@ pub fn icon(kind: Icon, size: f32, color: Hsla) -> impl IntoElement {
                     path.move_to(at(12.0, 9.0));
                     path.arc_to(radius(3.0), px(0.0), false, true, at(12.0, 15.0));
                     path.arc_to(radius(3.0), px(0.0), false, true, at(12.0, 9.0));
+                }
+                Icon::Music => {
+                    // Two eighth notes joined by a beam.
+                    path.add_polygon(&[at(9.0, 17.0), at(9.0, 5.0), at(20.0, 3.0), at(20.0, 15.0)], false);
+                    path.move_to(at(9.0, 9.0));
+                    path.line_to(at(20.0, 7.0));
+                    for (x, y) in [(6.5, 17.0), (17.5, 15.0)] {
+                        path.move_to(at(x, y - 2.5));
+                        path.arc_to(radius(2.5), px(0.0), false, true, at(x, y + 2.5));
+                        path.arc_to(radius(2.5), px(0.0), false, true, at(x, y - 2.5));
+                    }
+                }
+                Icon::Previous | Icon::Next => {
+                    let flip = |x: f32| if matches!(kind, Icon::Next) { 24.0 - x } else { x };
+                    path.add_polygon(&[at(flip(19.0), 5.0), at(flip(8.0), 12.0), at(flip(19.0), 19.0)], true);
+                    path.move_to(at(flip(5.5), 5.0));
+                    path.line_to(at(flip(5.5), 19.0));
+                }
+                Icon::Shuffle => {
+                    path.move_to(at(3.0, 7.0));
+                    path.line_to(at(7.0, 7.0));
+                    path.line_to(at(15.0, 17.0));
+                    path.line_to(at(20.0, 17.0));
+                    path.move_to(at(3.0, 17.0));
+                    path.line_to(at(7.0, 17.0));
+                    path.line_to(at(15.0, 7.0));
+                    path.line_to(at(20.0, 7.0));
+                    for y in [7.0, 17.0] {
+                        path.add_polygon(&[at(17.5, y - 2.5), at(20.5, y), at(17.5, y + 2.5)], false);
+                    }
+                }
+                Icon::Repeat | Icon::RepeatOne => {
+                    path.add_polygon(&[at(4.0, 13.0), at(4.0, 7.0), at(19.0, 7.0)], false);
+                    path.add_polygon(&[at(16.0, 4.0), at(19.0, 7.0), at(16.0, 10.0)], false);
+                    path.add_polygon(&[at(20.0, 11.0), at(20.0, 17.0), at(5.0, 17.0)], false);
+                    path.add_polygon(&[at(8.0, 14.0), at(5.0, 17.0), at(8.0, 20.0)], false);
+                    if matches!(kind, Icon::RepeatOne) {
+                        path.move_to(at(11.0, 11.0));
+                        path.line_to(at(12.5, 10.0));
+                        path.line_to(at(12.5, 14.5));
+                    }
+                }
+                Icon::ThumbUp | Icon::ThumbDown => {
+                    let y = |y: f32| if matches!(kind, Icon::ThumbDown) { 24.0 - y } else { y };
+                    path.add_polygon(&[at(3.0, y(10.0)), at(7.0, y(10.0)), at(7.0, y(20.0)), at(3.0, y(20.0))], true);
+                    path.add_polygon(
+                        &[
+                            at(7.0, y(10.0)),
+                            at(11.0, y(3.5)),
+                            at(13.0, y(4.5)),
+                            at(12.0, y(9.0)),
+                            at(19.5, y(9.0)),
+                            at(21.0, y(11.0)),
+                            at(19.0, y(19.0)),
+                            at(17.0, y(20.0)),
+                            at(7.0, y(20.0)),
+                        ],
+                        false,
+                    );
+                }
+                Icon::ChevronUp | Icon::ChevronDown => {
+                    let y = |y: f32| if matches!(kind, Icon::ChevronDown) { 24.0 - y } else { y };
+                    path.add_polygon(&[at(5.0, y(15.0)), at(12.0, y(8.0)), at(19.0, y(15.0))], false);
                 }
             }
             if let Ok(path) = path.build() {

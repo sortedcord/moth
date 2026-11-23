@@ -176,9 +176,13 @@ impl Player {
 
 #[interface(name = "org.mpris.MediaPlayer2.Player")]
 impl Player {
-    fn next(&self) {}
+    fn next(&self) {
+        self.send(Command::Next);
+    }
 
-    fn previous(&self) {}
+    fn previous(&self) {
+        self.send(Command::Previous);
+    }
 
     fn pause(&self) {
         self.send(Command::Pause);
@@ -312,12 +316,13 @@ impl Player {
 
     #[zbus(property)]
     fn can_go_next(&self) -> bool {
-        false
+        self.now().queue.is_some_and(|queue| queue.has_next)
     }
 
     #[zbus(property)]
     fn can_go_previous(&self) -> bool {
-        false
+        // Previous also restarts the current track.
+        self.now().queue.is_some()
     }
 
     #[zbus(property)]

@@ -12,8 +12,10 @@
 //! after handing them out. They leave this module once they work (see [`resolve_with_ytdlp`]).
 
 mod account;
+pub use account::SessionExpired;
 mod feed;
 mod history;
+mod music;
 mod visionos;
 mod ytdlp;
 
@@ -32,6 +34,7 @@ use super::media::{
     AlternateUrls, AudioCodec, AudioStream, AudioTrack, Channel, Link, Location, Published, StreamCatalog, StreamId,
     VideoCodec, VideoDetails, VideoRef, VideoStream, VideoSummary, Watching,
 };
+use super::music::{MusicShelf, PlayTarget, QueuePage, Rating};
 use super::selection::StreamPreferences;
 use super::source::{BoxFuture, VideoSource};
 
@@ -296,6 +299,33 @@ impl VideoSource for YouTube {
         }))
     }
 
+    fn music_home(&self) -> Option<BoxFuture<Vec<MusicShelf>>> {
+        let (account, client) = (self.account(Role::Recommendations), self.client.clone());
+        Some(Box::pin(async move { music::home(&account, &client).await }))
+    }
+
+    fn music_queue(&self, target: PlayTarget) -> Option<BoxFuture<QueuePage>> {
+        let (account, client) = (self.account(Role::Recommendations), self.client.clone());
+        Some(Box::pin(async move { music::queue(&account, &client, &target).await }))
+    }
+
+    fn music_queue_more(&self, more: String) -> Option<BoxFuture<QueuePage>> {
+        let (account, client) = (self.account(Role::Recommendations), self.client.clone());
+        Some(Box::pin(async move { music::queue_more(&account, &client, &more).await }))
+    }
+
+    fn rating(&self, id: String) -> Option<BoxFuture<Rating>> {
+        let account = self.account(Role::Recommendations);
+        account.method()?;
+        Some(Box::pin(async move { music::rating(&account, &id).await }))
+    }
+
+    fn rate(&self, id: String, rating: Rating) -> Option<BoxFuture<()>> {
+        let account = self.account(Role::Recommendations);
+        account.method()?;
+        Some(Box::pin(async move { music::rate(&account, &id, rating).await }))
+    }
+
     /// Into the recommendation account's history, if it's signed in.
     fn watching(&self, id: String, watching: Watching) -> Option<BoxFuture<()>> {
         let account = self.account(Role::Recommendations);
@@ -507,6 +537,35 @@ mod tests {
         let mut single = StreamCatalog { audio: vec![audio(251, None)], ..catalog };
         number_tracks(&mut single);
         assert_eq!(single.audio[0].id, StreamId(251));
+    }
+
+    /// Network test: `cargo test -- --ignored --nocapture live_music`
+    #[test]
+    #[ignore]
+    fn live_music() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let youtube =
+            runtime.block_on(YouTube::new(reqwest::Client::new(), Resolver::default(), None)).expect("client");
+        let shelves = runtime.block_on(youtube.music_home().unwrap()).expect("music home");
+        for shelf in &shelves {
+            println!(
+                "== {} ({:?}): {} items, e.g. {:?}",
+                shelf.title,
+                shelf.layout,
+                shelf.items.len(),
+                shelf.items[0].title
+            );
+        }
+        let target =
+            shelves.iter().flat_map(|shelf| &shelf.items).find_map(|item| item.play.clone()).expect("a target");
+        let page = runtime.block_on(youtube.music_queue(target.clone()).unwrap()).expect("queue");
+        println!("queue for {target:?}: {} tracks, more: {}", page.tracks.len(), page.more.is_some());
+        for track in page.tracks.iter().take(3) {
+            println!("  {} | {} | {:?} | {:?}", track.title, track.artists, track.detail, track.duration);
+        }
+        let more = runtime.block_on(youtube.music_queue_more(page.more.expect("more")).unwrap()).expect("more");
+        println!("next page: {} tracks", more.tracks.len());
+        assert!(!more.tracks.is_empty());
     }
 
     /// Network test: `cargo test -- --ignored --nocapture live_catalog`

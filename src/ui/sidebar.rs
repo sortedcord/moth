@@ -12,6 +12,7 @@ use super::theme::{ACCENT, HOVER, MUTED, ON_ACCENT, PANEL, TEXT};
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Entry {
     Home,
+    Music,
     Settings,
 }
 
@@ -19,6 +20,7 @@ impl Entry {
     fn icon(self) -> Icon {
         match self {
             Self::Home => Icon::Home,
+            Self::Music => Icon::Music,
             Self::Settings => Icon::Settings,
         }
     }
@@ -26,6 +28,7 @@ impl Entry {
     fn label(self) -> &'static str {
         match self {
             Self::Home => "Home",
+            Self::Music => "Music",
             Self::Settings => "Settings",
         }
     }
@@ -33,6 +36,7 @@ impl Entry {
     fn open(self, view: &mut AppView, window: &mut Window, cx: &mut Context<AppView>) {
         match self {
             Self::Home => view.go_home(window, cx),
+            Self::Music => view.open_music(window, cx),
             Self::Settings => view.open_settings(window, cx),
         }
     }
@@ -75,6 +79,7 @@ pub fn render(width: f32, active: Entry, cx: &mut Context<AppView>) -> impl Into
         .justify_center()
         .child(play_icon(9.0, rgb(ON_ACCENT).into()));
     let home = item(Entry::Home);
+    let music = item(Entry::Music);
     let settings = item(Entry::Settings);
 
     div()
@@ -104,6 +109,7 @@ pub fn render(width: f32, active: Entry, cx: &mut Context<AppView>) -> impl Into
                 .child(div().font_weight(FontWeight::SEMIBOLD).child("moth"))
         })
         .child(home)
+        .child(music)
         .child(div().flex_1())
         .child(settings)
 }

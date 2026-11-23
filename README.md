@@ -25,6 +25,10 @@ a browser extension that sends YouTube links to it.
 - **Fluid UI.** Layout changes animate on springs instead of jumping, rendered with Vulkan.
 - **Light on resources.** While the window is out of sight (another workspace, scrolled away, covered), moth
   stops downloading and decoding video and only plays the audio; the picture catches up when you look again.
+- **YouTube Music.** A Music tab with your YouTube Music home (signed out, the popular one), and a now-playing
+  bar on every page: queues from a song's radio or a playlist that keep going, previous/next, seeking, shuffle,
+  repeat, like/dislike, and an expanded player with the queue and a Song/Video switch. Songs play as audio
+  alone (no video downloaded or decoded) unless you pick Video.
 - **Accounts.** A recommendation account for your own home feed, and a playback account for videos that need
   you signed in, each signed in with a code at google.com/device or a browser session; kept in your keyring.
 - **Your defaults.** Preferred resolution and codecs, default speed, seek steps, animations and more are
@@ -123,11 +127,13 @@ bars. Without a running moth it prints `{"running":false,…}`; `--watch` then w
  "stream":{"width":1280,"height":720,"fps":60.0,"quality":"720p60","quality_auto":true,
            "video_codec":"VP9","audio_codec":"Opus","audio_track":null,"decoder":"vavp9dec","resolver":"rustypipe",
            "fallback_urls":false,"video_suspended":false},
- "fullscreen":false}
+ "fullscreen":false,"queue":null}
 ```
 
-`status` is one of `idle`, `resolving`, `buffering`, `playing`, `paused`, `ended`, `error`; `page` is `home`, `watch`
-or `settings`. `video_suspended` is true while video is off because the window is out of sight. `audio_track` names the audio track
+`status` is one of `idle`, `resolving`, `buffering`, `playing`, `paused`, `ended`, `error`; `page` is `home`, `music`,
+`watch` or `settings`. `video_suspended` is true while video is off because the window is out of sight. `queue` is set while music plays:
+`has_next`, `has_previous`, `shuffle` and `repeat` (`off`, `all`, `one`); MPRIS next/previous move through it.
+`audio_track` names the audio track
 (e.g. `"German"`) for videos with several, such as dubs. Title and channel are `null` until the watch page has loaded. Under the hood this is the
 `$XDG_RUNTIME_DIR/moth.sock` socket: send the line `status` or `watch` (a URL line opens that video).
 

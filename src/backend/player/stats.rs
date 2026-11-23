@@ -20,14 +20,14 @@ pub struct PlayerStats {
     /// Negotiated caps at the sinks, e.g. "1920x1080 @ 24/1 · NV12 (memory:DMABuf)".
     pub video_caps: Option<String>,
     pub audio_caps: Option<String>,
-    pub video_sink: SinkStats,
+    pub video_sink: Option<SinkStats>,
     pub audio_sink: SinkStats,
     /// Decoded data waiting in front of each sink.
-    pub video_queue: QueueLevel,
+    pub video_queue: Option<QueueLevel>,
     pub audio_queue: QueueLevel,
     /// Last rendered video timestamp minus last rendered audio timestamp, in milliseconds.
     pub av_offset_ms: Option<f64>,
-    pub video_net: NetStats,
+    pub video_net: Option<NetStats>,
     pub audio_net: NetStats,
     /// Video is neither fetched nor decoded (see [`super::Player::set_video_suspended`]).
     pub video_suspended: bool,

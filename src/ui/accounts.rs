@@ -66,13 +66,20 @@ impl AppView {
     pub(super) fn refresh_accounts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let refresh = cx.global::<BackendHandle>().0.refresh_accounts();
         cx.spawn_in(window, async move |this, cx| {
-            refresh.await.ok();
-            this.update(cx, |this, cx| {
+            let signed_out = refresh.await.unwrap_or_default();
+            this.update_in(cx, |this, window, cx| {
                 let backend = cx.global::<BackendHandle>().0.clone();
                 for role in Role::ALL {
                     let account = this.accounts.get_mut(role);
                     if matches!(account.state, AccountState::SignedIn(_)) {
                         account.state = state_of(backend.account(role));
+                    }
+                }
+                for (role, why) in signed_out {
+                    this.accounts.get_mut(role).error = Some(why);
+                    if role == Role::Recommendations {
+                        this.reload_feed(window, cx);
+                        this.music_home_changed(window, cx);
                     }
                 }
                 cx.notify();
@@ -194,6 +201,7 @@ impl AppView {
         self.accounts.get_mut(role).state = state_of(info);
         if role == Role::Recommendations {
             self.reload_feed(window, cx);
+            self.music_home_changed(window, cx);
         }
         cx.notify();
     }

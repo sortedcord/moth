@@ -25,6 +25,9 @@ pub enum Command {
     SetRate(f64),
     Raise,
     Quit,
+    /// Music: the next or previous track.
+    Next,
+    Previous,
     /// Sign an account in with a browser session's cookies (from the browser extension).
     SignIn {
         role: Role,

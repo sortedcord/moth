@@ -30,7 +30,8 @@ impl StreamPreferences {
 impl StreamCatalog {
     /// The automatic pick: best video and audio (in the default track).
     pub fn auto_selection(&self, preferences: &StreamPreferences) -> Option<Selection> {
-        Some(Selection { video: self.auto_video(preferences, None)?.id, audio: self.auto_audio(preferences, None)?.id })
+        let video = self.auto_video(preferences, None)?.id;
+        Some(Selection { video: Some(video), audio: self.auto_audio(preferences, None)?.id })
     }
 
     /// Best stream at or below the preferred height, preferring `keep_codec` (if given) and then
@@ -152,11 +153,17 @@ mod tests {
     fn auto_pick_follows_preferences() {
         let catalog = catalog();
         let mut preferences = StreamPreferences::default();
-        assert_eq!(catalog.auto_selection(&preferences), Some(Selection { video: StreamId(3), audio: StreamId(11) }));
+        assert_eq!(
+            catalog.auto_selection(&preferences),
+            Some(Selection { video: Some(StreamId(3)), audio: StreamId(11) })
+        );
 
         preferences.video_codecs = vec![VideoCodec::Av1];
         preferences.audio_codec = AudioCodec::Aac;
-        assert_eq!(catalog.auto_selection(&preferences), Some(Selection { video: StreamId(2), audio: StreamId(10) }));
+        assert_eq!(
+            catalog.auto_selection(&preferences),
+            Some(Selection { video: Some(StreamId(2)), audio: StreamId(10) })
+        );
 
         // Keeping the current codec wins over the preference order.
         assert_eq!(catalog.auto_video(&preferences, Some(VideoCodec::Vp9)).map(|v| v.id), Some(StreamId(3)));

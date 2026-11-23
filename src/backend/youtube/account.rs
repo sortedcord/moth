@@ -110,11 +110,24 @@ impl Account {
         Ok(self.client.user_auth_access_token().await?)
     }
 
-    /// Look up the account's name. Errors leave the info as it was.
+    /// Look up the account's name. Errors leave the info as it was, except that a browser
+    /// session YouTube no longer accepts is forgotten ([`SessionExpired`]).
     pub async fn refresh_info(&self) -> Result<AccountInfo> {
         let method = self.method().ok_or_else(|| anyhow!("not signed in"))?;
+        if method == Method::Cookies
+            && let Err(rustypipe::error::Error::Auth(_)) = self.client.user_auth_check_cookie().await
+        {
+            self.client.user_auth_remove_cookie().await.ok();
+            *lock(&self.info) = None;
+            return Err(SessionExpired.into());
+        }
         let (query, client) = self.query().ok_or_else(|| anyhow!("not signed in"))?;
-        let response = query.raw(client, "account/accounts_list", &serde_json::json!({})).await?;
+        // The TV app lists accounts; the web has the signed-in one in its account menu.
+        let endpoint = match method {
+            Method::DeviceCode => "account/accounts_list",
+            Method::Cookies => "account/account_menu",
+        };
+        let response = query.raw(client, endpoint, &serde_json::json!({})).await?;
         let response: serde_json::Value = serde_json::from_str(&response).context("unexpected account list")?;
         let (name, handle) = selected_account(&response).ok_or_else(|| anyhow!("no account in the account list"))?;
         let info = AccountInfo { name, handle, method };
@@ -201,6 +214,19 @@ impl Account {
         result.context("couldn't sign out")
     }
 }
+
+/// A browser session's cookies stopped working (YouTube rotated them, or the session was
+/// signed out), so the account was signed out.
+#[derive(Debug)]
+pub struct SessionExpired;
+
+impl std::fmt::Display for SessionExpired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The browser session expired, so this account was signed out. Share or paste a fresh one, or sign in with a code.")
+    }
+}
+
+impl std::error::Error for SessionExpired {}
 
 /// The selected account's name and handle in an `account/accounts_list` response.
 fn selected_account(response: &serde_json::Value) -> Option<(String, Option<String>)> {

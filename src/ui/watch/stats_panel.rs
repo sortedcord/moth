@@ -14,6 +14,7 @@ pub fn render(session: &PlaybackSession) -> Option<impl IntoElement + use<>> {
     let secs = |time: Option<Duration>| time.map_or("—".to_string(), |time| format!("{:.3}s", time.as_secs_f64()));
     let kib = |bytes: u64| format!("{:.0} KiB", bytes as f64 / 1024.0);
     // GStreamer resets these counters on every pause/resume.
+    let none = || "none (audio only)".to_string();
     let sink = |s: SinkStats| format!("{} rendered · {} dropped (since last play)", s.rendered, s.dropped);
     let queue = |q: QueueLevel| {
         format!("{} buf · {} · {:.0} ms", q.buffers, kib(u64::from(q.bytes)), q.time.as_secs_f64() * 1e3)
@@ -54,15 +55,15 @@ pub fn render(session: &PlaybackSession) -> Option<impl IntoElement + use<>> {
         ("stream", session.stream_summary().unwrap_or_default()),
         ("video caps", stats.video_caps.clone().unwrap_or_default()),
         ("audio caps", stats.audio_caps.clone().unwrap_or_default()),
-        ("video sink", sink(stats.video_sink)),
+        ("video sink", stats.video_sink.map_or_else(none, sink)),
         ("audio sink", sink(stats.audio_sink)),
-        ("video queue", queue(stats.video_queue)),
+        ("video queue", stats.video_queue.map_or_else(none, queue)),
         ("audio queue", queue(stats.audio_queue)),
         (
             "a/v offset",
             stats.av_offset_ms.map_or("—".to_string(), |ms| format!("{ms:+.1} ms (last video − last audio pts)")),
         ),
-        ("video net", net(&stats.video_net)),
+        ("video net", stats.video_net.as_ref().map_or_else(none, net)),
         ("video", if stats.video_suspended { "suspended: window hidden" } else { "running" }.to_string()),
         ("audio net", net(&stats.audio_net)),
         ("last jump", jump),

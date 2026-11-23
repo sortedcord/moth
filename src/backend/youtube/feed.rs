@@ -184,14 +184,19 @@ fn find_text(value: &Value, key: &str) -> Option<String> {
 }
 
 #[derive(Deserialize)]
-struct Thumbnail {
+pub struct Thumbnail {
     url: String,
     #[serde(default)]
     width: u32,
 }
 
+/// A `thumbnails` array.
+pub fn thumbnails(value: Option<&Value>) -> Vec<Thumbnail> {
+    value.and_then(|value| serde_json::from_value(value.clone()).ok()).unwrap_or_default()
+}
+
 /// Smallest thumbnail at least `min_width` wide, else the largest.
-fn pick_thumbnail(thumbnails: &[Thumbnail], min_width: u32) -> Option<String> {
+pub fn pick_thumbnail(thumbnails: &[Thumbnail], min_width: u32) -> Option<String> {
     thumbnails
         .iter()
         .filter(|thumbnail| thumbnail.width >= min_width)

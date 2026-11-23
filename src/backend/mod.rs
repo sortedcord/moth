@@ -6,6 +6,7 @@
 pub mod accounts;
 mod local;
 pub mod media;
+pub mod music;
 pub mod player;
 mod secrets;
 pub mod selection;
@@ -20,6 +21,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use crate::dev::DevOptions;
 use accounts::{AccountInfo, DeviceCode, Role};
 use media::{AlternateUrls, Link, Selection, StreamCatalog, VideoDetails, VideoRef, VideoSummary, Watching};
+use music::{MusicShelf, PlayTarget, QueuePage, Rating};
 use selection::StreamPreferences;
 use source::VideoSource;
 
@@ -129,7 +131,7 @@ impl Backend {
             return None;
         }
         let source = self.source(video.source).ok()?;
-        let video_stream = catalog.video_stream(selection.video)?;
+        let video_stream = catalog.video_stream(selection.video?)?;
         let audio_stream = catalog.audio_stream(selection.audio)?;
         let future = source.alternate_urls(video.id.clone(), video_stream, audio_stream)?;
         Some(self.run(future))
@@ -176,6 +178,40 @@ impl Backend {
         });
     }
 
+    // ── Music ────────────────────────────────────────────────────────────────
+
+    /// The music home (YouTube Music's; the only site with music so far).
+    pub fn music_home(&self) -> impl Future<Output = Result<Vec<MusicShelf>>> + use<> {
+        let home = self.youtube.music_home();
+        self.run(async move { home.ok_or_else(|| anyhow!("no music"))?.await })
+    }
+
+    pub fn music_queue(&self, target: PlayTarget) -> impl Future<Output = Result<QueuePage>> + use<> {
+        let queue = self.source(target.source).ok().and_then(|source| source.music_queue(target));
+        self.run(async move { queue.ok_or_else(|| anyhow!("that site has no music"))?.await })
+    }
+
+    pub fn music_queue_more(&self, source: &str, more: String) -> impl Future<Output = Result<QueuePage>> + use<> {
+        let queue = self.source(source).ok().and_then(|source| source.music_queue_more(more));
+        self.run(async move { queue.ok_or_else(|| anyhow!("that site has no music"))?.await })
+    }
+
+    /// The signed-in listener's rating of a track; `None` (as a rating) when nobody's signed in.
+    pub fn rating(&self, video: &VideoRef) -> impl Future<Output = Result<Rating>> + use<> {
+        let rating = self.source(video.source).ok().and_then(|source| source.rating(video.id.clone()));
+        self.run(async move {
+            match rating {
+                Some(rating) => rating.await,
+                None => Ok(Rating::None),
+            }
+        })
+    }
+
+    pub fn rate(&self, video: &VideoRef, rating: Rating) -> impl Future<Output = Result<()>> + use<> {
+        let rate = self.source(video.source).ok().and_then(|source| source.rate(video.id.clone(), rating));
+        self.run(async move { rate.ok_or_else(|| anyhow!("sign in a recommendation account to rate tracks"))?.await })
+    }
+
     // ── Accounts ─────────────────────────────────────────────────────────────
 
     /// Who's signed in for `role`, if anyone.
@@ -184,15 +220,26 @@ impl Backend {
     }
 
     /// Look up the signed-in accounts' names (at startup they're only known to be signed in).
-    pub fn refresh_accounts(&self) -> impl Future<Output = Result<()>> + use<> {
+    /// Returns the accounts that were signed out because their session expired, and why.
+    pub fn refresh_accounts(&self) -> impl Future<Output = Result<Vec<(Role, String)>>> + use<> {
         let accounts: Vec<_> = Role::ALL.iter().map(|role| self.youtube.account(*role)).collect();
         self.run(async move {
+            let mut signed_out = Vec::new();
             for account in accounts.iter().filter(|account| account.method().is_some()) {
-                if let Err(err) = account.refresh_info().await {
-                    eprintln!("moth: couldn't look up the YouTube {}: {err:#}", account.role().name().to_lowercase());
+                match account.refresh_info().await {
+                    Ok(_) => {}
+                    Err(err) if err.is::<youtube::SessionExpired>() => {
+                        signed_out.push((account.role(), err.to_string()))
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "moth: couldn't look up the YouTube {}: {err:#}",
+                            account.role().name().to_lowercase()
+                        )
+                    }
                 }
             }
-            Ok(())
+            Ok(signed_out)
         })
     }
 

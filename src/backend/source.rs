@@ -10,6 +10,7 @@ use anyhow::Result;
 use super::media::{
     AlternateUrls, AudioStream, Link, StreamCatalog, VideoDetails, VideoStream, VideoSummary, Watching,
 };
+use super::music::{MusicShelf, PlayTarget, QueuePage, Rating};
 use super::selection::StreamPreferences;
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'static>>;
@@ -62,6 +63,30 @@ pub trait VideoSource: Send + Sync {
     /// Tell the site how far a video has been watched, if it keeps a history (for a signed-in
     /// account, say). Errors are only logged.
     fn watching(&self, _id: String, _watching: Watching) -> Option<BoxFuture<()>> {
+        None
+    }
+
+    /// The site's music home, if it has music.
+    fn music_home(&self) -> Option<BoxFuture<Vec<MusicShelf>>> {
+        None
+    }
+
+    /// The play queue `target` starts.
+    fn music_queue(&self, _target: PlayTarget) -> Option<BoxFuture<QueuePage>> {
+        None
+    }
+
+    /// More of a queue (see [`QueuePage::more`]).
+    fn music_queue_more(&self, _more: String) -> Option<BoxFuture<QueuePage>> {
+        None
+    }
+
+    /// What the signed-in listener thinks of a track, if the site knows.
+    fn rating(&self, _id: String) -> Option<BoxFuture<Rating>> {
+        None
+    }
+
+    fn rate(&self, _id: String, _rating: Rating) -> Option<BoxFuture<()>> {
         None
     }
 
