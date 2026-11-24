@@ -60,19 +60,38 @@ pub enum Published {
     Text(String),
 }
 
-/// A video in a list (related videos, the home feed).
+/// A video in a list (related videos, the home feed, search results).
 #[derive(Clone, Debug)]
 pub struct VideoSummary {
     pub video: VideoRef,
     pub title: String,
     pub channel: Option<String>,
+    pub channel_avatar_url: Option<String>,
     pub views: Option<u64>,
     /// Relative age as the source words it, e.g. "3 years ago".
     pub age: Option<String>,
     pub duration: Option<Duration>,
     pub thumbnail_url: Option<String>,
+    pub description: Option<String>,
     /// Short-form vertical video (YouTube Shorts and the like).
     pub is_short: bool,
+}
+
+/// One page of video search results.
+#[derive(Clone, Debug)]
+pub struct SearchPage {
+    pub videos: Vec<VideoSummary>,
+    /// If the site corrected a typo in the query.
+    pub corrected_query: Option<String>,
+    /// Fetches the next page (opaque to everyone but the source).
+    pub more: Option<SearchMore>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SearchMore {
+    pub source: &'static str,
+    pub token: String,
+    pub visitor_data: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use rustypipe::client::RustyPipe;
+use rustypipe::model::paginator::ContinuationEndpoint;
 use rustypipe::model::richtext::ToPlaintext as _;
 use rustypipe::model::{
     AudioCodec as RpAudioCodec, Thumbnail, UrlTarget, VideoCodec as RpVideoCodec, VideoItem, VideoPlayer,
@@ -31,10 +32,13 @@ use rustypipe::model::{
 
 use super::accounts::{Method, Role};
 use super::media::{
-    AlternateUrls, AudioCodec, AudioStream, AudioTrack, Channel, Link, Location, Published, StreamCatalog, StreamId,
-    VideoCodec, VideoDetails, VideoRef, VideoStream, VideoSummary, Watching,
+    AlternateUrls, AudioCodec, AudioStream, AudioTrack, Channel, Link, Location, Published, SearchMore, SearchPage,
+    StreamCatalog, StreamId, VideoCodec, VideoDetails, VideoRef, VideoStream, VideoSummary, Watching,
 };
-use super::music::{MusicShelf, PlayTarget, QueuePage, Rating};
+use super::music::{
+    MusicSearchFilter, MusicSearchMore, MusicSearchPage, MusicSearchSuggestions, MusicShelf, PlayTarget, QueuePage,
+    Rating,
+};
 use super::selection::StreamPreferences;
 use super::source::{BoxFuture, VideoSource};
 
@@ -57,9 +61,22 @@ pub fn claims_url(url: &str) -> bool {
     HOSTS.contains(&host)
 }
 
-/// YouTube video IDs: 11 characters of URL-safe base64.
+/// Scheme-less YouTube links like `youtube.com/watch?v=…` or `youtu.be/…`.
+fn claims_host_path(input: &str) -> bool {
+    let Some((host, _)) = input.split_once('/') else { return false };
+    HOSTS.contains(&host)
+}
+
+/// YouTube video IDs: 11 characters of URL-safe base64. Plain words of 11 letters (like
+/// "programming" or "PlayStation") are left to search rather than treated as IDs.
 fn is_video_id(input: &str) -> bool {
-    input.len() == 11 && input.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    if input.len() != 11 || !input.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_') {
+        return false;
+    }
+    let has_non_alpha = input.bytes().any(|byte| byte.is_ascii_digit() || byte == b'-' || byte == b'_');
+    let upper = input.bytes().filter(u8::is_ascii_uppercase).count();
+    let lower = input.bytes().filter(u8::is_ascii_lowercase).count();
+    has_non_alpha || (upper >= 3 && lower > 0)
 }
 
 /// Where stream URLs come from, in the order they're tried.
@@ -169,7 +186,7 @@ impl VideoSource for YouTube {
     }
 
     fn claims(&self, input: &str) -> bool {
-        claims_url(input) || is_video_id(input)
+        claims_url(input) || claims_host_path(input) || is_video_id(input)
     }
 
     fn resolve(&self, input: String) -> BoxFuture<Link> {
@@ -314,6 +331,21 @@ impl VideoSource for YouTube {
         Some(Box::pin(async move { music::queue_more(&account, &client, &more).await }))
     }
 
+    fn music_search(&self, query: String, filter: MusicSearchFilter) -> Option<BoxFuture<MusicSearchPage>> {
+        let (account, client) = (self.account(Role::Recommendations), self.client.clone());
+        Some(Box::pin(async move { music::search(&account, &client, &query, filter).await }))
+    }
+
+    fn music_search_more(&self, more: MusicSearchMore) -> Option<BoxFuture<MusicSearchPage>> {
+        let (account, client) = (self.account(Role::Recommendations), self.client.clone());
+        Some(Box::pin(async move { music::search_more(&account, &client, &more.token).await }))
+    }
+
+    fn music_search_suggestions(&self, query: String) -> Option<BoxFuture<MusicSearchSuggestions>> {
+        let (account, client) = (self.account(Role::Recommendations), self.client.clone());
+        Some(Box::pin(async move { music::search_suggestions(&account, &client, &query).await }))
+    }
+
     fn rating(&self, id: String) -> Option<BoxFuture<Rating>> {
         let account = self.account(Role::Recommendations);
         account.method()?;
@@ -357,6 +389,30 @@ impl VideoSource for YouTube {
             }
             visionos::home(&http, &client).await
         }))
+    }
+
+    fn search(&self, query: String) -> Option<BoxFuture<SearchPage>> {
+        let client = self.client.clone();
+        Some(Box::pin(async move {
+            let result = client.query().search::<VideoItem, _>(&query).await?;
+            Ok(search_page(result.items.items, result.corrected_query, result.items.ctoken, result.visitor_data))
+        }))
+    }
+
+    fn search_more(&self, more: SearchMore) -> Option<BoxFuture<SearchPage>> {
+        let client = self.client.clone();
+        Some(Box::pin(async move {
+            let page = client
+                .query()
+                .continuation::<VideoItem, _>(more.token, ContinuationEndpoint::Search, more.visitor_data.as_deref())
+                .await?;
+            Ok(search_page(page.items, None, page.ctoken, page.visitor_data))
+        }))
+    }
+
+    fn search_suggestions(&self, query: String) -> Option<BoxFuture<Vec<String>>> {
+        let client = self.client.clone();
+        Some(Box::pin(async move { Ok(client.query().search_suggestion(&query).await?) }))
     }
 
     fn web_url(&self, id: &str) -> String {
@@ -465,13 +521,29 @@ fn catalog(player: &VideoPlayer) -> StreamCatalog {
     }
 }
 
+fn search_page(
+    items: Vec<VideoItem>,
+    corrected_query: Option<String>,
+    ctoken: Option<String>,
+    visitor_data: Option<String>,
+) -> SearchPage {
+    SearchPage {
+        videos: items.into_iter().map(summary).collect(),
+        corrected_query,
+        more: ctoken.map(|token| SearchMore { source: ID, token, visitor_data }),
+    }
+}
+
 fn summary(item: VideoItem) -> VideoSummary {
+    let channel_avatar_url = item.channel.as_ref().and_then(|channel| pick_thumbnail(&channel.avatar, 48));
     VideoSummary {
         thumbnail_url: pick_thumbnail(&item.thumbnail, 336),
         channel: item.channel.map(|channel| channel.name),
+        channel_avatar_url,
         duration: item.duration.map(|seconds| Duration::from_secs(seconds.into())),
         views: item.view_count,
         age: item.publish_date_txt,
+        description: item.short_description,
         is_short: item.is_short,
         video: VideoRef { source: ID, id: item.id },
         title: item.name,
@@ -499,7 +571,15 @@ mod tests {
         assert!(claims_url("https://youtu.be/aqz-KE-bpKQ"));
         assert!(!claims_url("https://www.youtube.com.evil.example/watch"));
         assert!(!claims_url("https://vimeo.com/1"));
+        assert!(claims_host_path("youtube.com/watch?v=aqz-KE-bpKQ"));
+        assert!(claims_host_path("youtu.be/aqz-KE-bpKQ"));
+        assert!(!claims_host_path("youtube tutorial"));
         assert!(is_video_id("aqz-KE-bpKQ"));
+        assert!(is_video_id("eRsGyueVLvQ"));
+        assert!(is_video_id("dQw4w9WgXcQ"));
+        assert!(!is_video_id("programming"));
+        assert!(!is_video_id("PROGRAMMING"));
+        assert!(!is_video_id("PlayStation"));
         assert!(!is_video_id("not an id"));
     }
 
@@ -537,6 +617,77 @@ mod tests {
         let mut single = StreamCatalog { audio: vec![audio(251, None)], ..catalog };
         number_tracks(&mut single);
         assert_eq!(single.audio[0].id, StreamId(251));
+    }
+
+    /// Network test: `cargo test -- --ignored --nocapture live_search`
+    #[test]
+    #[ignore]
+    fn live_search() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let youtube =
+            runtime.block_on(YouTube::new(reqwest::Client::new(), Resolver::default(), None)).expect("client");
+
+        let suggestions =
+            runtime.block_on(youtube.search_suggestions("blender spring".into()).unwrap()).expect("suggest");
+        println!("== YouTube suggestions: {suggestions:?}");
+        assert!(!suggestions.is_empty());
+
+        let page = runtime.block_on(youtube.search("blender spring".into()).unwrap()).expect("search");
+        println!("== YouTube search: {} videos, more: {}", page.videos.len(), page.more.is_some());
+        for video in page.videos.iter().take(3) {
+            println!("  {} | {:?} | {:?} | {:?}", video.title, video.channel, video.duration, video.description);
+        }
+        assert!(!page.videos.is_empty());
+        let more = runtime.block_on(youtube.search_more(page.more.expect("more")).unwrap()).expect("search more");
+        println!("== YouTube search page 2: {} videos", more.videos.len());
+        assert!(!more.videos.is_empty());
+
+        let music_suggest =
+            runtime.block_on(youtube.music_search_suggestions("daft punk".into()).unwrap()).expect("music suggest");
+        println!(
+            "== Music suggestions: {} terms {:?}, {} items",
+            music_suggest.terms.len(),
+            music_suggest.terms,
+            music_suggest.items.len()
+        );
+        for item in &music_suggest.items {
+            println!("  suggest item: {:?} | {} | {} | play={:?}", item.kind, item.title, item.subtitle, item.play);
+        }
+        assert!(!music_suggest.terms.is_empty());
+
+        let music_page = runtime
+            .block_on(youtube.music_search("daft punk".into(), MusicSearchFilter::All).unwrap())
+            .expect("music search");
+        println!("== Music search (All): {} shelves, more={}", music_page.shelves.len(), music_page.more.is_some());
+        for shelf in &music_page.shelves {
+            println!("  shelf {:?} (filter={:?}): {} items", shelf.title, shelf.filter, shelf.items.len());
+            for item in shelf.items.iter().take(3) {
+                println!("    {:?} | {} | {} | play={:?}", item.kind, item.title, item.subtitle, item.play);
+            }
+        }
+        assert!(music_page.shelves.iter().map(|s| s.items.len()).sum::<usize>() > 5);
+
+        for filter in [
+            MusicSearchFilter::Songs,
+            MusicSearchFilter::Videos,
+            MusicSearchFilter::Albums,
+            MusicSearchFilter::Playlists,
+            MusicSearchFilter::Artists,
+        ] {
+            let page = runtime
+                .block_on(youtube.music_search("daft punk".into(), filter).unwrap())
+                .expect("filtered music search");
+            let count = page.shelves.first().map_or(0, |s| s.items.len());
+            println!("== Music search ({:?}): {} items, more={}", filter, count, page.more.is_some());
+            assert!(count > 0);
+            if filter == MusicSearchFilter::Songs {
+                let more = runtime
+                    .block_on(youtube.music_search_more(page.more.expect("songs more")).unwrap())
+                    .expect("music songs more");
+                println!("== Music search (Songs page 2): {} items", more.shelves.first().map_or(0, |s| s.items.len()));
+                assert!(!more.shelves.is_empty());
+            }
+        }
     }
 
     /// Network test: `cargo test -- --ignored --nocapture live_music`

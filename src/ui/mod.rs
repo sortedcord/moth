@@ -14,11 +14,14 @@ mod images;
 mod layout;
 mod music;
 mod music_page;
+mod music_search_page;
 mod now_playing;
 mod playback;
 mod presence;
+mod search_page;
 mod settings_page;
 mod sidebar;
+mod suggestions;
 mod text_input;
 mod theme;
 mod watch;
@@ -29,25 +32,32 @@ use std::time::Duration;
 
 use gpui::{
     App, Bounds, ClickEvent, Context, Entity, FocusHandle, Focusable as _, FontWeight, Global, SharedString,
-    Subscription, Task, Window, WindowBounds, WindowDecorations, WindowOptions, div, linear_color_stop,
+    Subscription, Task, Window, WindowBounds, WindowDecorations, WindowHandle, WindowOptions, div, linear_color_stop,
     linear_gradient, prelude::*, px, rgb, size,
 };
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 
 use crate::backend::Backend;
 use crate::backend::media::{Link, VideoRef, VideoSummary};
-use crate::backend::music::PlayTarget;
+use crate::backend::music::{MusicSearchFilter, PlayTarget};
 use crate::backend::player::WaylandTarget;
 use crate::desktop::status::{Hub, NowPlaying, Page, QueueInfo, VideoInfo};
 use crate::desktop::{Command, socket};
 use crate::dev::DevOptions;
 use crate::settings::Settings;
-use actions::{APP, Cancel, CycleFrameOverlay, FocusAddress, OpenSettings, ToggleLayoutTargets, ToggleSlowMotion};
+use actions::{
+    APP, Cancel, CycleFrameOverlay, FocusAddress, GoHome, OpenMusic, OpenSettings, ToggleLayoutTargets,
+    ToggleSlowMotion,
+};
+use icons::{Icon, icon};
 use images::ImageCache;
 use layout::HomeLayout;
+use music_search_page::{MusicSearchEvent, MusicSearchPage};
 use playback::PlaybackSession;
-use text_input::{Submit, TextInput};
-use theme::{ACCENT, BG_BOTTOM, BG_TOP, FAINT, FOCUS_RING, FONT, HOVER, PAD, PANEL, TEXT, VIDEO_BG};
+use search_page::{SearchEvent, VideoSearchPage};
+use suggestions::{Suggestion, SuggestionsPopup};
+use text_input::{Change, Step, Submit, TextInput};
+use theme::{ACCENT, BG_BOTTOM, BG_TOP, FAINT, FOCUS_RING, FONT, HOVER, MUTED, PAD, PANEL, TEXT, VIDEO_BG};
 use watch::{OpenVideo, WatchPage};
 
 impl Global for Settings {}
@@ -131,21 +141,30 @@ pub enum FeedStatus {
     Failed(SharedString),
 }
 
+#[derive(Clone)]
 enum Route {
     Home,
+    Search(Entity<VideoSearchPage>),
     Music,
+    MusicSearch(Entity<MusicSearchPage>),
     /// The expanded music player.
     Player,
     Watch(Entity<WatchPage>),
     Settings,
 }
 
+const YOUTUBE_PLACEHOLDER: &str = "Search YouTube or paste a link";
+const MUSIC_PLACEHOLDER: &str = "Search YouTube Music or paste a link";
+
 pub struct AppView {
     route: Route,
     session: Entity<PlaybackSession>,
     images: Entity<ImageCache>,
     address: Entity<TextInput>,
+    address_bounds: watch::BoundsTracker,
     address_error: Option<SharedString>,
+    suggestions: Option<WindowHandle<SuggestionsPopup>>,
+    _suggest: Option<Task<()>>,
     accounts: accounts::Accounts,
     /// Where a browser session's cookies are pasted, on the settings page.
     cookie_input: Entity<TextInput>,
@@ -155,6 +174,8 @@ pub struct AppView {
     /// Recommendations still loading, or why they failed.
     feed_status: FeedStatus,
     music_home: Option<music_page::MusicHome>,
+    /// Where leaving the watch page goes back to (e.g. search results).
+    before_watch: Option<Route>,
     /// Where closing the expanded player goes back to.
     before_player: Option<Route>,
     music_seek: watch::BoundsTracker,
@@ -170,6 +191,8 @@ pub struct AppView {
     _presence: Option<Task<()>>,
     _resolve: Option<Task<()>>,
     _feed: Option<Task<()>>,
+    _search_subscription: Option<Subscription>,
+    _music_search_subscription: Option<Subscription>,
     _page_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
     _commands: Task<()>,
@@ -192,15 +215,8 @@ impl AppView {
         let feed = cx.global::<BackendHandle>().0.featured();
         let target = wayland_target(window);
         let session = cx.new(|cx| PlaybackSession::new(target, cx));
-        let address = cx.new(|cx| {
-            TextInput::new(
-                "Paste a video link and press Enter",
-                rgb(TEXT).into(),
-                rgb(FAINT).into(),
-                rgb(ACCENT).into(),
-                cx,
-            )
-        });
+        let address = cx
+            .new(|cx| TextInput::new(YOUTUBE_PLACEHOLDER, rgb(TEXT).into(), rgb(FAINT).into(), rgb(ACCENT).into(), cx));
         let cookie_input = cx.new(|cx| {
             TextInput::new(
                 "Paste a Cookie header or cookies.txt and press Enter",
@@ -210,9 +226,36 @@ impl AppView {
                 cx,
             )
         });
+        let weak = cx.weak_entity();
+        let address_focus = address.focus_handle(cx);
         let subscriptions = vec![
             cx.subscribe_in(&address, window, |this, _, event: &Submit, window, cx| {
-                this.submit_address(event.0.to_string(), window, cx);
+                if let Some(selected) = this.selected_suggestion(cx) {
+                    this.pick_suggestion(selected, window, cx);
+                } else {
+                    this.submit_address(event.0.to_string(), window, cx);
+                }
+            }),
+            cx.subscribe_in(&address, window, |this, _, event: &Change, window, cx| {
+                this.on_address_change(event.0.to_string(), window, cx);
+            }),
+            cx.subscribe(&address, |this, _, event: &Step, cx| {
+                this.step_suggestion(*event, cx);
+            }),
+            cx.on_blur(&address_focus, window, |this, _, cx| {
+                this.close_suggestions(cx);
+            }),
+            cx.on_window_closed(move |cx, id| {
+                let weak = weak.clone();
+                cx.defer(move |cx| {
+                    weak.update(cx, |this, cx| {
+                        if this.suggestions.is_some_and(|popup| popup.window_id() == id) {
+                            this.suggestions = None;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                });
             }),
             cx.subscribe_in(&cookie_input, window, |this, _, event: &Submit, window, cx| {
                 if let Some(role) = this.accounts.pasting() {
@@ -229,9 +272,13 @@ impl AppView {
                 this.platform_shown = visibility.is_visible();
                 this.apply_shown(cx);
             }),
-            // Fullscreen changes come with a resize.
-            cx.observe_window_bounds(window, |this, window, cx| this.publish(window, cx)),
+            // Fullscreen changes and resizes move the address bar, so dismiss suggestions too.
+            cx.observe_window_bounds(window, |this, window, cx| {
+                this.close_suggestions(cx);
+                this.publish(window, cx);
+            }),
         ];
+        cx.on_release(|this, cx| this.remove_suggestions(cx)).detach();
         // Links from `moth <url>` / the browser extension, and MPRIS controls.
         let commands = cx.spawn_in(window, async move |this, cx| {
             while let Ok(command) = commands.recv().await {
@@ -246,7 +293,10 @@ impl AppView {
             session,
             images: cx.new(|_| ImageCache::default()),
             address,
+            address_bounds: Default::default(),
             address_error: None,
+            suggestions: None,
+            _suggest: None,
             accounts: accounts::Accounts::new(cx),
             cookie_input,
             settings_error: None,
@@ -254,6 +304,7 @@ impl AppView {
             feed,
             feed_status: FeedStatus::Loading,
             music_home: None,
+            before_watch: None,
             before_player: None,
             music_seek: Default::default(),
             _music_home: None,
@@ -265,6 +316,8 @@ impl AppView {
             _presence: None,
             _resolve: None,
             _feed: None,
+            _search_subscription: None,
+            _music_search_subscription: None,
             _page_subscriptions: Vec::new(),
             _subscriptions: subscriptions,
             _commands: commands,
@@ -325,22 +378,202 @@ impl AppView {
         }));
     }
 
-    // ── Navigation ───────────────────────────────────────────────────────────
+    // ── Navigation & Search ──────────────────────────────────────────────────
+
+    fn is_music_context(&self) -> bool {
+        matches!(self.route, Route::Music | Route::MusicSearch(_) | Route::Player)
+    }
+
+    fn sync_address_placeholder(&self, cx: &mut Context<Self>) {
+        let placeholder = if self.is_music_context() { MUSIC_PLACEHOLDER } else { YOUTUBE_PLACEHOLDER };
+        self.address.update(cx, |input, cx| input.set_placeholder(placeholder, cx));
+    }
+
+    fn on_address_change(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.address_error = None;
+        let trimmed = text.trim().to_string();
+        let backend = cx.global::<BackendHandle>().0.clone();
+        if trimmed.is_empty() || backend.claims(&trimmed) {
+            self._suggest = None;
+            self.close_suggestions(cx);
+            cx.notify();
+            return;
+        }
+        let music = self.is_music_context();
+        self._suggest = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(150)).await;
+            let items = if music {
+                match backend.music_search_suggestions(trimmed).await {
+                    Ok(suggest) => {
+                        let mut items: Vec<Suggestion> = suggest.terms.into_iter().map(Suggestion::Query).collect();
+                        items.extend(suggest.items.into_iter().map(Suggestion::Music));
+                        items
+                    }
+                    Err(_) => Vec::new(),
+                }
+            } else {
+                backend
+                    .search_suggestions(trimmed)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(Suggestion::Query)
+                    .collect()
+            };
+            this.update_in(cx, |this, window, cx| this.show_suggestions(items, window, cx)).ok();
+        }));
+        cx.notify();
+    }
+
+    fn show_suggestions(&mut self, items: Vec<Suggestion>, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.address.focus_handle(cx).is_focused(window) || items.is_empty() {
+            self.close_suggestions(cx);
+            return;
+        }
+        let urls: Vec<String> = items
+            .iter()
+            .filter_map(|item| match item {
+                Suggestion::Music(music) => music.thumbnail_url.clone(),
+                Suggestion::Query(_) => None,
+            })
+            .collect();
+        self.images.update(cx, |images, cx| urls.into_iter().for_each(|url| images.load(url, cx)));
+
+        if let Some(popup) = self.suggestions {
+            if popup.update(cx, |popup, window, cx| popup.set_items(items.clone(), window, cx)).is_ok() {
+                return;
+            }
+            self.suggestions = None;
+        }
+        let Some(anchor) = self.address_bounds.get() else { return };
+        match SuggestionsPopup::open(cx.weak_entity(), self.images.clone(), anchor, items, window, cx) {
+            Ok(popup) => {
+                self.suggestions = Some(popup);
+                cx.notify();
+            }
+            Err(err) => eprintln!("moth: failed to open search suggestions: {err:#}"),
+        }
+    }
+
+    fn step_suggestion(&mut self, step: Step, cx: &mut Context<Self>) {
+        let Some(popup) = self.suggestions else { return };
+        let delta = match step {
+            Step::Up => -1,
+            Step::Down => 1,
+        };
+        popup.update(cx, |popup, _, cx| popup.step(delta, cx)).ok();
+    }
+
+    fn selected_suggestion(&self, cx: &App) -> Option<Suggestion> {
+        self.suggestions.and_then(|popup| popup.read_with(cx, |popup, _| popup.selected_item()).ok().flatten())
+    }
+
+    pub(super) fn pick_suggestion(&mut self, suggestion: Suggestion, window: &mut Window, cx: &mut Context<Self>) {
+        self._suggest = None;
+        self.close_suggestions(cx);
+        match suggestion {
+            Suggestion::Query(term) => {
+                if self.is_music_context() {
+                    self.search_music(term, MusicSearchFilter::All, window, cx);
+                } else {
+                    self.search_videos(term, window, cx);
+                }
+            }
+            Suggestion::Music(item) => {
+                if let Some(target) = item.play {
+                    self.address.update(cx, |input, cx| input.set_text(item.title, window, cx));
+                    window.focus(&self.focus, cx);
+                    self.play_music(target, window, cx);
+                } else {
+                    self.search_music(item.title, MusicSearchFilter::All, window, cx);
+                }
+            }
+        }
+    }
+
+    pub(super) fn close_suggestions(&mut self, cx: &mut Context<Self>) {
+        if self.suggestions.is_some() {
+            self.remove_suggestions(cx);
+            cx.notify();
+        }
+    }
+
+    fn remove_suggestions(&mut self, cx: &mut App) {
+        if let Some(popup) = self.suggestions.take() {
+            popup.update(cx, |_, window, _| window.remove_window()).ok();
+        }
+    }
 
     fn submit_address(&mut self, input: String, window: &mut Window, cx: &mut Context<Self>) {
+        self._suggest = None;
+        self.close_suggestions(cx);
         self.address_error = None;
-        let resolve = cx.global::<BackendHandle>().0.resolve(input);
-        self._resolve = Some(cx.spawn_in(window, async move |this, cx| {
-            let result = resolve.await;
-            this.update_in(cx, |this, window, cx| match result {
-                Ok(Link { video, start }) => this.open_video_at(video, start, window, cx),
-                Err(err) => {
-                    this.address_error = Some(format!("{err:#}").into());
-                    cx.notify();
+        let trimmed = input.trim().to_string();
+        if trimmed.is_empty() {
+            cx.notify();
+            return;
+        }
+        let backend = cx.global::<BackendHandle>().0.clone();
+        if backend.claims(&trimmed) {
+            let resolve = backend.resolve(trimmed);
+            self._resolve = Some(cx.spawn_in(window, async move |this, cx| {
+                let result = resolve.await;
+                this.update_in(cx, |this, window, cx| match result {
+                    Ok(Link { video, start }) => {
+                        this.before_watch = None;
+                        this.open_video_at(video, start, window, cx);
+                    }
+                    Err(err) => {
+                        this.address_error = Some(format!("{err:#}").into());
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }));
+            cx.notify();
+        } else if self.is_music_context() {
+            self.search_music(trimmed, MusicSearchFilter::All, window, cx);
+        } else {
+            self.search_videos(trimmed, window, cx);
+        }
+    }
+
+    fn search_videos(&mut self, query: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_watch(window, cx);
+        self.before_watch = None;
+        self.address.update(cx, |input, cx| input.set_text(query.clone(), window, cx));
+        let images = self.images.clone();
+        let page = cx.new(|cx| VideoSearchPage::new(query, images, cx));
+        self._search_subscription =
+            Some(cx.subscribe_in(&page, window, |this, _, event: &SearchEvent, window, cx| match event {
+                SearchEvent::OpenVideo(video) => {
+                    this.before_watch = Some(this.route.clone());
+                    this.open_video(video.clone(), window, cx);
                 }
-            })
-            .ok();
-        }));
+                SearchEvent::GoHome => this.go_home(window, cx),
+            }));
+        self.route = Route::Search(page);
+        self.sync_address_placeholder(cx);
+        window.focus(&self.focus, cx);
+        self.publish(window, cx);
+        cx.notify();
+    }
+
+    fn search_music(&mut self, query: String, filter: MusicSearchFilter, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_watch(window, cx);
+        self.before_watch = None;
+        self.address.update(cx, |input, cx| input.set_text(query.clone(), window, cx));
+        let images = self.images.clone();
+        let page = cx.new(|cx| MusicSearchPage::new(query, filter, images, cx));
+        self._music_search_subscription =
+            Some(cx.subscribe_in(&page, window, |this, _, event: &MusicSearchEvent, window, cx| match event {
+                MusicSearchEvent::Play(target) => this.play_music(target.clone(), window, cx),
+                MusicSearchEvent::GoMusic => this.open_music(window, cx),
+            }));
+        self.route = Route::MusicSearch(page);
+        self.sync_address_placeholder(cx);
+        window.focus(&self.focus, cx);
+        self.publish(window, cx);
         cx.notify();
     }
 
@@ -349,6 +582,8 @@ impl AppView {
     }
 
     fn open_video_at(&mut self, video: VideoRef, start: Option<Duration>, window: &mut Window, cx: &mut Context<Self>) {
+        self._suggest = None;
+        self.close_suggestions(cx);
         self.session.update(cx, |session, cx| session.open(video.clone(), start, cx));
         let link = cx.global::<BackendHandle>().0.web_url(&video).unwrap_or_default();
         self.address.update(cx, |input, cx| input.set_text(link, window, cx));
@@ -366,12 +601,15 @@ impl AppView {
         ];
         window.focus(&page.focus_handle(cx), cx);
         self.route = Route::Watch(page);
+        self.sync_address_placeholder(cx);
         self.publish(window, cx);
         cx.notify();
     }
 
     /// Leaving a video's watch page stops the video; music plays on wherever you go.
     fn leave_watch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self._suggest = None;
+        self.close_suggestions(cx);
         self.leave_player(cx);
         if matches!(self.route, Route::Watch(_)) {
             self.session.update(cx, |session, cx| session.close(cx));
@@ -381,17 +619,35 @@ impl AppView {
         window.focus(&self.focus, cx);
     }
 
+    fn leave_watch_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(Route::Search(page)) = self.before_watch.take() {
+            self.leave_watch(window, cx);
+            let query = page.read(cx).query().to_string();
+            self.address.update(cx, |input, cx| input.set_text(query, window, cx));
+            self.route = Route::Search(page);
+            self.sync_address_placeholder(cx);
+            self.publish(window, cx);
+            cx.notify();
+        } else {
+            self.go_home(window, cx);
+        }
+    }
+
     fn go_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.before_watch = None;
         self.leave_watch(window, cx);
         self.route = Route::Home;
+        self.sync_address_placeholder(cx);
         self.publish(window, cx);
         cx.notify();
     }
 
     fn open_music(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.before_watch = None;
         self.leave_watch(window, cx);
         self.leave_player(cx);
         self.route = Route::Music;
+        self.sync_address_placeholder(cx);
         if !matches!(self.music_home, Some(music_page::MusicHome::Loaded(_))) {
             self.load_music_home(window, cx);
         }
@@ -462,8 +718,10 @@ impl AppView {
         if window.is_fullscreen() {
             window.toggle_fullscreen();
         }
+        self.before_watch = None;
         self.leave_watch(window, cx);
         self.route = Route::Settings;
+        self.sync_address_placeholder(cx);
         self.settings_error = None;
         self.publish(window, cx);
         cx.notify();
@@ -580,8 +838,8 @@ impl AppView {
         NowPlaying {
             running: true,
             page: match self.route {
-                Route::Home => Page::Home,
-                Route::Music | Route::Player => Page::Music,
+                Route::Home | Route::Search(_) => Page::Home,
+                Route::Music | Route::MusicSearch(_) | Route::Player => Page::Music,
                 Route::Watch(_) => Page::Watch,
                 Route::Settings => Page::Settings,
             },
@@ -603,13 +861,29 @@ impl AppView {
         self.address.update(cx, |input, cx| input.focus_and_select_all(window, cx));
     }
 
+    fn on_go_home(&mut self, _: &GoHome, window: &mut Window, cx: &mut Context<Self>) {
+        if window.is_fullscreen() {
+            window.toggle_fullscreen();
+        }
+        self.go_home(window, cx);
+    }
+
+    fn on_open_music(&mut self, _: &OpenMusic, window: &mut Window, cx: &mut Context<Self>) {
+        if window.is_fullscreen() {
+            window.toggle_fullscreen();
+        }
+        self.open_music(window, cx);
+    }
+
     fn on_open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
         self.open_settings(window, cx);
     }
 
-    /// Esc that nothing closer handled: leave the address bar.
+    /// Esc that nothing closer handled: close suggestions, or leave the address bar.
     fn on_cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
-        if self.address.focus_handle(cx).is_focused(window) {
+        if self.suggestions.is_some() {
+            self.close_suggestions(cx);
+        } else if self.address.focus_handle(cx).is_focused(window) {
             match &self.route {
                 Route::Watch(page) => window.focus(&page.focus_handle(cx), cx),
                 _ => window.focus(&self.focus, cx),
@@ -634,6 +908,9 @@ impl AppView {
     // ── Rendering ────────────────────────────────────────────────────────────
 
     fn top_bar(&self, back: bool, address_focused: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let back_label = if matches!(self.before_watch, Some(Route::Search(_))) { "← Search" } else { "← Home" };
+        let has_text = !self.address.read(cx).text().is_empty();
+        let suggestions_open = self.suggestions.is_some();
         div()
             .flex()
             .items_center()
@@ -654,12 +931,13 @@ impl AppView {
                         .items_center()
                         .text_sm()
                         .font_weight(FontWeight::MEDIUM)
-                        .child("← Home")
-                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.go_home(window, cx))),
+                        .child(back_label)
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.leave_watch_back(window, cx))),
                 )
             })
             .child(
                 div()
+                    .relative()
                     .flex_1()
                     .max_w(px(560.0))
                     .h(px(38.0))
@@ -670,9 +948,40 @@ impl AppView {
                     .px_4()
                     .flex()
                     .items_center()
+                    .gap_2p5()
                     .text_sm()
                     .line_height(px(20.0))
-                    .child(self.address.clone()),
+                    .when(suggestions_open, |pill| {
+                        pill.on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_suggestions(cx)))
+                    })
+                    .child(icon(Icon::Search, 15.0, rgb(MUTED).into()))
+                    .child(div().flex_1().min_w_0().child(self.address.clone()))
+                    .when(has_text, |pill| {
+                        pill.child(
+                            div()
+                                .id("clear-address")
+                                .size(px(22.0))
+                                .flex_none()
+                                .rounded_full()
+                                .hover(|style| style.bg(rgb(HOVER)))
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this._suggest = None;
+                                    this.close_suggestions(cx);
+                                    this.address_error = None;
+                                    this.address.update(cx, |input, cx| {
+                                        input.set_text("", window, cx);
+                                        input.focus_and_select_all(window, cx);
+                                    });
+                                    cx.notify();
+                                }))
+                                .child(icon(Icon::Close, 12.0, rgb(MUTED).into())),
+                        )
+                    })
+                    .child(self.address_bounds.element()),
             )
             .when_some(self.address_error.clone(), |bar, error| {
                 bar.child(div().text_xs().text_color(rgb(ACCENT)).max_w(px(320.0)).truncate().child(error))
@@ -685,6 +994,8 @@ impl AppView {
             .key_context(APP)
             .track_focus(&self.focus)
             .on_action(cx.listener(Self::on_focus_address))
+            .on_action(cx.listener(Self::on_go_home))
+            .on_action(cx.listener(Self::on_open_music))
             .on_action(cx.listener(Self::on_open_settings))
             .on_action(cx.listener(Self::on_cancel))
             .on_action(cx.listener(Self::on_toggle_layout_targets))
@@ -713,12 +1024,13 @@ impl Render for AppView {
                 .gap_4()
                 .child(self.top_bar(true, address_focused, cx))
                 .child(page.clone()),
-            Route::Home | Route::Settings | Route::Music | Route::Player => {
+            Route::Home | Route::Search(_) | Route::Settings | Route::Music | Route::MusicSearch(_) | Route::Player => {
                 let animate = cx.global::<Settings>().animations_enabled(cx.reduce_motion());
                 if self.layout.step(viewport_w, animate) {
                     window.request_animation_frame();
                 }
-                let (entry, content) = match self.route {
+                let (entry, content) = match &self.route {
+                    Route::Search(page) => (sidebar::Entry::Home, page.clone().into_any_element()),
                     Route::Music => (
                         sidebar::Entry::Music,
                         match &self.music_home {
@@ -726,6 +1038,7 @@ impl Render for AppView {
                             None => div().into_any_element(),
                         },
                     ),
+                    Route::MusicSearch(page) => (sidebar::Entry::Music, page.clone().into_any_element()),
                     Route::Player => (
                         sidebar::Entry::Music,
                         now_playing::expanded(

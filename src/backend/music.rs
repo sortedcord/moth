@@ -41,13 +41,72 @@ pub struct MusicItem {
     pub play: Option<PlayTarget>,
 }
 
-/// Where a queue starts: a track, a playlist (an album, a mix), or a track within a playlist.
+/// Where a queue starts: a track, a playlist (an album, a mix), a track within a playlist,
+/// or a browse ID (an album or artist from search results, resolved when played).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlayTarget {
     /// The site, as in [`VideoRef::source`].
     pub source: &'static str,
     pub track: Option<String>,
     pub playlist: Option<String>,
+    pub browse: Option<String>,
+}
+
+/// Category filter for music search.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MusicSearchFilter {
+    #[default]
+    All,
+    Songs,
+    Videos,
+    Albums,
+    Playlists,
+    Artists,
+}
+
+impl MusicSearchFilter {
+    pub const ALL: [Self; 6] = [Self::All, Self::Songs, Self::Videos, Self::Albums, Self::Playlists, Self::Artists];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Songs => "Songs",
+            Self::Videos => "Videos",
+            Self::Albums => "Albums",
+            Self::Playlists => "Playlists",
+            Self::Artists => "Artists",
+        }
+    }
+}
+
+/// One page of music search results: shelves of songs, videos, albums, playlists and artists.
+#[derive(Clone, Debug)]
+pub struct MusicSearchPage {
+    pub shelves: Vec<MusicSearchShelf>,
+    pub corrected_query: Option<String>,
+    /// Fetches the next page when viewing a filtered category.
+    pub more: Option<MusicSearchMore>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MusicSearchShelf {
+    pub title: String,
+    pub items: Vec<MusicItem>,
+    /// Category filter to view all items in this shelf (on the unfiltered "All" page).
+    pub filter: Option<MusicSearchFilter>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MusicSearchMore {
+    pub source: &'static str,
+    pub token: String,
+}
+
+/// Autocomplete suggestions for a partial music search query.
+#[derive(Clone, Debug, Default)]
+pub struct MusicSearchSuggestions {
+    pub terms: Vec<String>,
+    pub items: Vec<MusicItem>,
 }
 
 /// One entry of a play queue.

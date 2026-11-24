@@ -9,6 +9,8 @@ pub enum Icon {
     Home,
     Settings,
     Music,
+    Search,
+    Close,
     Previous,
     Next,
     Shuffle,
@@ -66,6 +68,19 @@ pub fn icon(kind: Icon, size: f32, color: Hsla) -> impl IntoElement {
                         path.arc_to(radius(2.5), px(0.0), false, true, at(x, y + 2.5));
                         path.arc_to(radius(2.5), px(0.0), false, true, at(x, y - 2.5));
                     }
+                }
+                Icon::Search => {
+                    path.move_to(at(10.5, 4.0));
+                    path.arc_to(radius(6.5), px(0.0), false, true, at(10.5, 17.0));
+                    path.arc_to(radius(6.5), px(0.0), false, true, at(10.5, 4.0));
+                    path.move_to(at(15.2, 15.2));
+                    path.line_to(at(20.5, 20.5));
+                }
+                Icon::Close => {
+                    path.move_to(at(6.0, 6.0));
+                    path.line_to(at(18.0, 18.0));
+                    path.move_to(at(18.0, 6.0));
+                    path.line_to(at(6.0, 18.0));
                 }
                 Icon::Previous | Icon::Next => {
                     let flip = |x: f32| if matches!(kind, Icon::Next) { 24.0 - x } else { x };

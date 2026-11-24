@@ -380,6 +380,7 @@ pub fn expanded(
 impl AppView {
     /// Open or close the expanded player.
     pub(super) fn toggle_player(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) {
+        self.close_suggestions(cx);
         if matches!(self.route, Route::Player) {
             self.route = self.before_player.take().unwrap_or(Route::Music);
             // Video only plays where it can be seen.
@@ -391,6 +392,7 @@ impl AppView {
             }
             self.session.update(cx, |session, cx| session.set_music_visible(true, cx));
         }
+        self.sync_address_placeholder(cx);
         self.publish(window, cx);
         cx.notify();
     }

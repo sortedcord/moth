@@ -8,9 +8,13 @@ use std::pin::Pin;
 use anyhow::Result;
 
 use super::media::{
-    AlternateUrls, AudioStream, Link, StreamCatalog, VideoDetails, VideoStream, VideoSummary, Watching,
+    AlternateUrls, AudioStream, Link, SearchMore, SearchPage, StreamCatalog, VideoDetails, VideoStream, VideoSummary,
+    Watching,
 };
-use super::music::{MusicShelf, PlayTarget, QueuePage, Rating};
+use super::music::{
+    MusicSearchFilter, MusicSearchMore, MusicSearchPage, MusicSearchSuggestions, MusicShelf, PlayTarget, QueuePage,
+    Rating,
+};
 use super::selection::StreamPreferences;
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'static>>;
@@ -92,6 +96,36 @@ pub trait VideoSource: Send + Sync {
 
     /// The site's recommendations for the home page, if it has any.
     fn recommendations(&self) -> Option<BoxFuture<Vec<VideoSummary>>> {
+        None
+    }
+
+    /// Search for videos matching `query`.
+    fn search(&self, _query: String) -> Option<BoxFuture<SearchPage>> {
+        None
+    }
+
+    /// Next page of video search results (see [`SearchPage::more`]).
+    fn search_more(&self, _more: SearchMore) -> Option<BoxFuture<SearchPage>> {
+        None
+    }
+
+    /// Autocomplete suggestions for a partial video search query.
+    fn search_suggestions(&self, _query: String) -> Option<BoxFuture<Vec<String>>> {
+        None
+    }
+
+    /// Search the site's music catalog.
+    fn music_search(&self, _query: String, _filter: MusicSearchFilter) -> Option<BoxFuture<MusicSearchPage>> {
+        None
+    }
+
+    /// Next page of music search results (see [`MusicSearchPage::more`]).
+    fn music_search_more(&self, _more: MusicSearchMore) -> Option<BoxFuture<MusicSearchPage>> {
+        None
+    }
+
+    /// Autocomplete suggestions for a partial music search query.
+    fn music_search_suggestions(&self, _query: String) -> Option<BoxFuture<MusicSearchSuggestions>> {
         None
     }
 }

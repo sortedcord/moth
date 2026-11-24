@@ -7,9 +7,9 @@ hardware by GStreamer and handed straight to the Wayland compositor. It uses a f
 power of watching in a browser tab, and it fits into the desktop: media keys, MPRIS, a status CLI for bars and
 a browser extension that sends YouTube links to it.
 
-> **Status:** early and under active development. Watching videos works well; the home page shows YouTube's
-> recommendations (yours, once a recommendation account is signed in), and there are no subscriptions or
-> search yet. Linux + Wayland only.
+> **Status:** early and under active development. Watching videos, YouTube Music, and search work well;
+> the home page shows YouTube's recommendations (yours, once a recommendation account is signed in), and
+> there are no subscriptions yet. Linux + Wayland only.
 
 ## Features
 
@@ -17,8 +17,9 @@ a browser extension that sends YouTube links to it.
   go to the compositor through a Wayland subsurface, and moth never touches video pixels.
 - **Quality and playback controls.** Resolution and codec selection (automatic or manual), audio tracks
   (dubs), playback speed from 0.25× to 2×, fullscreen.
-- **Paste anything.** Watch, `youtu.be` and Shorts links or bare video IDs in the address bar (links with a
-  timestamp start there); video details, description and related videos on the watch page.
+- **Search and paste anything.** Search YouTube (or YouTube Music when on the Music tab) with autocomplete
+  suggestions and pagination, or paste watch, `youtu.be` and Shorts links or bare video IDs in the top bar
+  (links with a timestamp start there); video details, description and related videos on the watch page.
 - **Desktop integration.** An MPRIS player for media keys, shells and `playerctl`; `moth status [--watch]`
   for status bars; single-instance handoff, so `moth <url>` opens the link in the running window.
 - **Browser handoff.** A Chromium extension that opens YouTube links in moth instead of the browser.
@@ -66,18 +67,20 @@ for Intel GPUs; use your GPU's VA-API driver and Vulkan driver instead (e.g. `li
 
 ## Usage
 
-Paste a YouTube link (watch, `youtu.be`, Shorts, … or a bare video ID) into the address bar and press Enter.
-`moth <url>` from a shell does the same, in the running window if there is one.
+Search or paste a YouTube link (watch, `youtu.be`, Shorts, … or a bare video ID) into the top bar and press
+Enter. On the Music tab, the top bar searches YouTube Music instead. `moth <url>` from a shell opens a link
+in the running window if there is one.
 
 | Key | Action |
 |---|---|
-| `Ctrl+L` | Focus the address bar |
+| `Ctrl+L` | Focus the search / address bar |
+| `Ctrl+1` / `Ctrl+2` | Home / Music |
 | `Ctrl+,` | Settings |
 | `space` / `k` | Play / pause |
 | `j` / `l` | Back / forward 10 s (adjustable in settings) |
 | `←` / `→` | Back / forward 5 s (adjustable in settings) |
 | `f`, or double-click the video | Fullscreen |
-| `Esc` | Leave fullscreen |
+| `Esc` | Close suggestions, leave the address bar, or leave fullscreen |
 
 Watch-page keys apply when the address bar isn't focused. The gear button under the video has quality, codec,
 audio track and speed. Settings are saved to `~/.config/moth/settings.json`.

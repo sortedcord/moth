@@ -126,10 +126,12 @@ impl Local {
             video: VideoRef { source: ID, id: name.to_string() },
             title: manifest.title.clone(),
             channel: Some(format!("{} (local)", manifest.channel.as_deref().unwrap_or("local file"))),
+            channel_avatar_url: None,
             views: manifest.views,
             age: None,
             duration: manifest.duration.map(Duration::from_secs_f64),
             thumbnail_url: manifest.thumbnail.as_ref().map(|file| self.url(name, file)),
+            description: None,
             is_short: false,
         }
     }

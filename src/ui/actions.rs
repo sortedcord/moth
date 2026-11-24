@@ -14,8 +14,10 @@ actions!(
     moth,
     [
         FocusAddress,
+        GoHome,
+        OpenMusic,
         OpenSettings,
-        /// Esc: leave the address bar, close a menu, or leave fullscreen.
+        /// Esc: close suggestions, leave the address bar, close a menu, or leave fullscreen.
         Cancel,
         TogglePause,
         SeekBack,
@@ -50,7 +52,9 @@ macro_rules! shortcut {
 }
 
 pub const SHORTCUTS: &[Shortcut] = &[
-    shortcut!(&["ctrl-l"], APP, FocusAddress, Some("Ctrl L"), |_| "Focus the address bar".into()),
+    shortcut!(&["ctrl-l"], APP, FocusAddress, Some("Ctrl L"), |_| "Focus the search / address bar".into()),
+    shortcut!(&["ctrl-1"], APP, GoHome, Some("Ctrl 1"), |_| "Home".into()),
+    shortcut!(&["ctrl-2"], APP, OpenMusic, Some("Ctrl 2"), |_| "Music".into()),
     shortcut!(&["ctrl-,"], APP, OpenSettings, Some("Ctrl ,"), |_| "Open settings".into()),
     shortcut!(&["space", "k"], WATCH, TogglePause, Some("Space / K"), |_| "Play or pause".into()),
     shortcut!(&["j"], WATCH, SeekBackLong, Some("J / L"), |s| format!("Back / forward {} s", s.seek_step_long)),

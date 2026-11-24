@@ -5,16 +5,35 @@ use gpui::{ElementId, FontWeight, ImageSource, ObjectFit, Pixels, SharedString, 
 use super::theme::{ACCENT, BG_BOTTOM, DEEP, HOVER, MUTED, ON_ACCENT, TEXT, TRACK};
 
 pub fn thumbnail(source: Option<ImageSource>, duration: Option<String>, w: Pixels, h: Pixels) -> impl IntoElement {
+    thumbnail_inner(source, duration, w, h, false)
+}
+
+pub fn round_thumbnail(source: Option<ImageSource>, diameter: Pixels) -> impl IntoElement {
+    thumbnail_inner(source, None, diameter, diameter, true)
+}
+
+fn thumbnail_inner(
+    source: Option<ImageSource>,
+    duration: Option<String>,
+    w: Pixels,
+    h: Pixels,
+    round: bool,
+) -> impl IntoElement {
     div()
         .relative()
         .flex_none()
         .w(w)
         .h(h)
-        .rounded_lg()
+        .map(|frame| if round { frame.rounded_full() } else { frame.rounded_lg() })
         .overflow_hidden()
         .bg(rgb(DEEP))
         .when_some(source, |frame, source| {
-            frame.child(img(source).size_full().rounded_lg().object_fit(ObjectFit::Cover))
+            frame.child(
+                img(source)
+                    .size_full()
+                    .map(|img| if round { img.rounded_full() } else { img.rounded_lg() })
+                    .object_fit(ObjectFit::Cover),
+            )
         })
         .when_some(duration, |frame, duration| {
             frame.child(

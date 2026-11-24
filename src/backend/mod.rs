@@ -20,8 +20,14 @@ use anyhow::{Context as _, Result, anyhow, bail};
 
 use crate::dev::DevOptions;
 use accounts::{AccountInfo, DeviceCode, Role};
-use media::{AlternateUrls, Link, Selection, StreamCatalog, VideoDetails, VideoRef, VideoSummary, Watching};
-use music::{MusicShelf, PlayTarget, QueuePage, Rating};
+use media::{
+    AlternateUrls, Link, SearchMore, SearchPage, Selection, StreamCatalog, VideoDetails, VideoRef, VideoSummary,
+    Watching,
+};
+use music::{
+    MusicSearchFilter, MusicSearchMore, MusicSearchPage, MusicSearchSuggestions, MusicShelf, PlayTarget, QueuePage,
+    Rating,
+};
 use selection::StreamPreferences;
 use source::VideoSource;
 
@@ -88,6 +94,13 @@ impl Backend {
 
     fn source(&self, id: &str) -> Result<&Arc<dyn VideoSource>> {
         self.sources.iter().find(|source| source.id() == id).ok_or_else(|| anyhow!("unknown video source `{id}`"))
+    }
+
+    /// Whether `input` looks like a link or video ID a source can open directly (rather than a
+    /// search query).
+    pub fn claims(&self, input: &str) -> bool {
+        let input = input.trim();
+        self.sources.iter().any(|source| source.claims(input))
     }
 
     /// The video a pasted link (or ID) refers to, from whichever source claims it.
@@ -164,6 +177,35 @@ impl Backend {
         })
     }
 
+    /// Search for videos matching `query`.
+    pub fn search(&self, query: String) -> impl Future<Output = Result<SearchPage>> + use<> {
+        let query = query.trim().to_string();
+        let search = self.sources.iter().find_map(|source| source.search(query.clone()));
+        self.run(async move {
+            if query.is_empty() {
+                bail!("Enter something to search for");
+            }
+            search.ok_or_else(|| anyhow!("search isn't available"))?.await
+        })
+    }
+
+    pub fn search_more(&self, more: SearchMore) -> impl Future<Output = Result<SearchPage>> + use<> {
+        let search = self.source(more.source).ok().and_then(|source| source.search_more(more));
+        self.run(async move { search.ok_or_else(|| anyhow!("search isn't available"))?.await })
+    }
+
+    pub fn search_suggestions(&self, query: String) -> impl Future<Output = Result<Vec<String>>> + use<> {
+        let query = query.trim().to_string();
+        let suggestions = (!query.is_empty())
+            .then(|| self.sources.iter().find_map(|source| source.search_suggestions(query.clone())));
+        self.run(async move {
+            match suggestions.flatten() {
+                Some(future) => future.await,
+                None => Ok(Vec::new()),
+            }
+        })
+    }
+
     /// Report progress through `video` to its site (history); failures are logged.
     pub fn watching(&self, video: &VideoRef, watching: Watching) {
         let Some(report) =
@@ -194,6 +236,41 @@ impl Backend {
     pub fn music_queue_more(&self, source: &str, more: String) -> impl Future<Output = Result<QueuePage>> + use<> {
         let queue = self.source(source).ok().and_then(|source| source.music_queue_more(more));
         self.run(async move { queue.ok_or_else(|| anyhow!("that site has no music"))?.await })
+    }
+
+    pub fn music_search(
+        &self,
+        query: String,
+        filter: MusicSearchFilter,
+    ) -> impl Future<Output = Result<MusicSearchPage>> + use<> {
+        let query = query.trim().to_string();
+        let search = self.sources.iter().find_map(|source| source.music_search(query.clone(), filter));
+        self.run(async move {
+            if query.is_empty() {
+                bail!("Enter something to search for");
+            }
+            search.ok_or_else(|| anyhow!("music search isn't available"))?.await
+        })
+    }
+
+    pub fn music_search_more(&self, more: MusicSearchMore) -> impl Future<Output = Result<MusicSearchPage>> + use<> {
+        let search = self.source(more.source).ok().and_then(|source| source.music_search_more(more));
+        self.run(async move { search.ok_or_else(|| anyhow!("music search isn't available"))?.await })
+    }
+
+    pub fn music_search_suggestions(
+        &self,
+        query: String,
+    ) -> impl Future<Output = Result<MusicSearchSuggestions>> + use<> {
+        let query = query.trim().to_string();
+        let suggestions = (!query.is_empty())
+            .then(|| self.sources.iter().find_map(|source| source.music_search_suggestions(query.clone())));
+        self.run(async move {
+            match suggestions.flatten() {
+                Some(future) => future.await,
+                None => Ok(MusicSearchSuggestions::default()),
+            }
+        })
     }
 
     /// The signed-in listener's rating of a track; `None` (as a rating) when nobody's signed in.

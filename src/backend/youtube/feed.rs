@@ -59,10 +59,12 @@ fn summary(id: &str, title: String) -> VideoSummary {
         video: VideoRef { source: super::ID, id: id.to_string() },
         title,
         channel: None,
+        channel_avatar_url: None,
         views: None,
         age: None,
         duration: None,
         thumbnail_url: None,
+        description: None,
         is_short: false,
     }
 }

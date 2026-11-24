@@ -4,7 +4,7 @@
 use gpui::{Context, Entity, FontWeight, ImageSource, SharedString, div, prelude::*, px, rgb};
 
 use super::AppView;
-use super::components::thumbnail;
+use super::components::{round_thumbnail, thumbnail};
 use super::images::ImageCache;
 use super::theme::{HOVER, MUTED, TEXT};
 use crate::backend::music::{MusicItem, MusicKind, MusicShelf, ShelfLayout};
@@ -105,12 +105,11 @@ fn card(
                 this.play_music(target, window, cx);
             }
         }))
-        .child(div().when(round, |frame| frame.rounded_full().overflow_hidden()).child(thumbnail(
-            image,
-            None,
-            px(CARD_W - 8.0),
-            px(CARD_W - 8.0),
-        )))
+        .child(if round {
+            round_thumbnail(image, px(CARD_W - 8.0)).into_any_element()
+        } else {
+            thumbnail(image, None, px(CARD_W - 8.0), px(CARD_W - 8.0)).into_any_element()
+        })
         .child(line(item.title.clone()).pt_1().text_sm().font_weight(FontWeight::SEMIBOLD))
         .child(line(item.subtitle.clone()).text_xs().text_color(rgb(MUTED)))
 }

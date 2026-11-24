@@ -15,7 +15,7 @@ use unicode_segmentation::UnicodeSegmentation as _;
 
 actions!(
     text_input,
-    [Backspace, Delete, Left, Right, SelectLeft, SelectRight, SelectAll, Home, End, Paste, Cut, Copy, Enter]
+    [Backspace, Delete, Left, Right, Up, Down, SelectLeft, SelectRight, SelectAll, Home, End, Paste, Cut, Copy, Enter]
 );
 
 const CONTEXT: &str = "TextInput";
@@ -26,6 +26,8 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("delete", Delete, Some(CONTEXT)),
         KeyBinding::new("left", Left, Some(CONTEXT)),
         KeyBinding::new("right", Right, Some(CONTEXT)),
+        KeyBinding::new("up", Up, Some(CONTEXT)),
+        KeyBinding::new("down", Down, Some(CONTEXT)),
         KeyBinding::new("shift-left", SelectLeft, Some(CONTEXT)),
         KeyBinding::new("shift-right", SelectRight, Some(CONTEXT)),
         KeyBinding::new("ctrl-a", SelectAll, Some(CONTEXT)),
@@ -40,6 +42,16 @@ pub fn bind_keys(cx: &mut App) {
 
 /// Emitted when the user presses Enter; carries the current text.
 pub struct Submit(pub SharedString);
+
+/// Emitted when the user edits the text (not on programmatic [`TextInput::set_text`]).
+pub struct Change(pub SharedString);
+
+/// Emitted when the user presses Up or Down inside the input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    Up,
+    Down,
+}
 
 pub struct TextInput {
     focus_handle: FocusHandle,
@@ -57,6 +69,8 @@ pub struct TextInput {
 }
 
 impl EventEmitter<Submit> for TextInput {}
+impl EventEmitter<Change> for TextInput {}
+impl EventEmitter<Step> for TextInput {}
 
 impl TextInput {
     pub fn new(
@@ -82,6 +96,18 @@ impl TextInput {
         }
     }
 
+    pub fn text(&self) -> &str {
+        &self.content
+    }
+
+    pub fn set_placeholder(&mut self, placeholder: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let placeholder = placeholder.into();
+        if self.placeholder != placeholder {
+            self.placeholder = placeholder;
+            cx.notify();
+        }
+    }
+
     pub fn set_text(&mut self, text: impl Into<SharedString>, window: &Window, cx: &mut Context<Self>) {
         self.content = text.into();
         self.marked_range = None;
@@ -97,6 +123,14 @@ impl TextInput {
 
     fn enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(Submit(self.content.clone()));
+    }
+
+    fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(Step::Up);
+    }
+
+    fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(Step::Down);
     }
 
     fn left(&mut self, _: &Left, window: &mut Window, cx: &mut Context<Self>) {
@@ -344,6 +378,7 @@ impl EntityInputHandler for TextInput {
         self.selection_reversed = false;
         self.marked_range.take();
         window.notify_text_input_changed(&self.focus_handle);
+        cx.emit(Change(self.content.clone()));
         cx.notify();
     }
 
@@ -375,6 +410,7 @@ impl EntityInputHandler for TextInput {
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
         self.selection_reversed = false;
         window.notify_text_input_changed(&self.focus_handle);
+        cx.emit(Change(self.content.clone()));
         cx.notify();
     }
 
@@ -581,6 +617,8 @@ impl Render for TextInput {
             .track_focus(&self.focus_handle(cx))
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::enter))
+            .on_action(cx.listener(Self::up))
+            .on_action(cx.listener(Self::down))
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
             .on_action(cx.listener(Self::left))
