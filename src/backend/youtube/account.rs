@@ -24,6 +24,9 @@ pub struct Account {
     /// What RustyPipe last stored (it holds the session cookie, which RustyPipe doesn't expose).
     cache: Arc<Mutex<Option<String>>>,
     info: Mutex<Option<AccountInfo>>,
+    /// Whether the session has YouTube Premium, and for which session (a hash of its cookies,
+    /// so signing in as somebody else asks again).
+    premium: Mutex<Option<(u64, bool)>>,
     /// A device sign-in waiting for the user.
     pending: tokio::sync::Mutex<Option<OauthDeviceCode>>,
     cancel: tokio::sync::Notify,
@@ -53,6 +56,7 @@ impl Account {
             client,
             cache,
             info: Mutex::new(None),
+            premium: Mutex::new(None),
             pending: Default::default(),
             cancel: Default::default(),
         };
@@ -103,6 +107,39 @@ impl Account {
         }
         let cache = lock(&self.cache).clone()?;
         Some(serde_json::from_str::<Cache>(&cache).ok()?.auth_cookie?.cookie)
+    }
+
+    /// Whether a cookie sign-in has YouTube Premium: the web's top bar shows Premium's logo.
+    /// Remembered per session; if YouTube can't be asked, it's assumed not (and asked again
+    /// next time). A code sign-in never is: it can't get Premium's streams (#17).
+    pub async fn is_premium(&self) -> bool {
+        use std::hash::{Hash as _, Hasher as _};
+        let Some(cookies) = self.cookie_header() else { return false };
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        cookies.hash(&mut hasher);
+        let session = hasher.finish();
+        if let Some((known, premium)) = *lock(&self.premium)
+            && known == session
+        {
+            return premium;
+        }
+        let result = async {
+            let (query, client) = self.query().ok_or_else(|| anyhow!("not signed in"))?;
+            let response = query.raw(client, "browse", &serde_json::json!({"browseId": "FEwhat_to_watch"})).await?;
+            let response: serde_json::Value = serde_json::from_str(&response)?;
+            let logo = response.pointer("/topbar/desktopTopbarRenderer/logo/topbarLogoRenderer/iconImage/iconType");
+            Ok::<_, anyhow::Error>(logo.and_then(|logo| logo.as_str()) == Some("YOUTUBE_PREMIUM_LOGO"))
+        };
+        match result.await {
+            Ok(premium) => {
+                *lock(&self.premium) = Some((session, premium));
+                premium
+            }
+            Err(err) => {
+                eprintln!("moth: couldn't tell whether the playback account has Premium: {err:#}");
+                false
+            }
+        }
     }
 
     /// An OAuth access token, for a device sign-in (refreshed as needed).

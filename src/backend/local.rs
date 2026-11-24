@@ -160,6 +160,7 @@ impl Local {
                         codec,
                         bitrate,
                         size: Some(size),
+                        premium: false,
                     });
                 }
                 ManifestStream::Audio { id, file, codec, bitrate } => {

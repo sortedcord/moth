@@ -87,12 +87,7 @@ fn items(page: MenuPage, session: &PlaybackSession, settings: &Settings) -> Vec<
             if let (Some(catalog), Some(video), Some(audio)) = (catalog, video, audio) {
                 let quality = if session.quality_auto() { format!("Auto ({})", video.label()) } else { video.label() };
                 items.push(item("Quality", Some(quality), false, MenuAction::Open(MenuPage::Quality)));
-                items.push(item(
-                    "Video format",
-                    Some(video.codec.to_string()),
-                    false,
-                    MenuAction::Open(MenuPage::Format),
-                ));
+                items.push(item("Video format", Some(video.format_label()), false, MenuAction::Open(MenuPage::Format)));
                 if catalog.tracks().len() > 1 {
                     let track = audio.track.as_ref().map_or("Default".to_string(), |track| track.name.clone());
                     items.push(item("Audio track", Some(track), false, MenuAction::Open(MenuPage::Track)));
@@ -132,7 +127,7 @@ fn items(page: MenuPage, session: &PlaybackSession, settings: &Settings) -> Vec<
                 .into_iter()
                 .map(|variant| {
                     let bitrate = variant.bitrate.map(|bitrate| format!("{:.1} Mbps", f64::from(bitrate) / 1e6));
-                    item(variant.codec.to_string(), bitrate, variant.id == video.id, MenuAction::Video(variant.id))
+                    item(variant.format_label(), bitrate, variant.id == video.id, MenuAction::Video(variant.id))
                 })
                 .collect()
         }

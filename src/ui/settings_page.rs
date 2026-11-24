@@ -73,8 +73,8 @@ pub fn accounts_section(
     let rows = Role::ALL.map(|role| {
         let description = match role {
             Role::Playback => {
-                "Plays videos that need you signed in, such as age-restricted ones. Premium's higher-bitrate \
-                 formats aren't supported yet."
+                "Plays videos that need you signed in, such as age-restricted ones. Signed in with a browser \
+                 session of a YouTube Premium account, it also plays Premium's higher-bitrate streams."
             }
             Role::Recommendations => {
                 "Your home feed comes from this account, and the videos you watch go into its history."

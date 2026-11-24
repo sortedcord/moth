@@ -8,6 +8,9 @@
 //!    refused.
 //! 3. yt-dlp alone.
 //!
+//! A playback account signed in with a Premium browser session adds Premium's streams to
+//! whichever catalog results (see [`premium_streams`]).
+//!
 //! yt-dlp's URLs have a catch of their own: YouTube may only start serving them a few seconds
 //! after handing them out. They leave this module once they work (see [`resolve_with_ytdlp`]).
 
@@ -161,6 +164,75 @@ async fn playback_streams(
     Some(result)
 }
 
+/// The itags of the 256 kbps audio only Premium accounts get.
+const PREMIUM_AUDIO_ITAGS: [u64; 2] = [141, 774];
+
+/// The longest moth waits for Premium's streams before playing without them.
+const PREMIUM_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// A video's Premium-only streams (see [`ytdlp::premium`]), if the playback account is signed
+/// in with a browser session that has Premium and the video has any. Failing to get them only
+/// means playing the usual streams.
+async fn premium_streams(account: Arc<account::Account>, id: String) -> Option<StreamCatalog> {
+    if account.method() != Some(Method::Cookies) || !account.is_premium().await {
+        return None;
+    }
+    let cookies = account.cookie_header()?;
+    let resolve = tokio::task::spawn_blocking(move || {
+        let cookie_file = ytdlp::CookieFile::new(&cookies)?;
+        ytdlp::premium(&id, cookie_file.path())
+    });
+    let resolved = match tokio::time::timeout(PREMIUM_TIMEOUT, resolve).await {
+        Ok(Ok(Ok(resolved))) => resolved,
+        Ok(Ok(Err(err))) => {
+            eprintln!("moth: no Premium streams: {err:#}");
+            return None;
+        }
+        Ok(Err(err)) => {
+            eprintln!("moth: no Premium streams: {err}");
+            return None;
+        }
+        Err(_) => {
+            eprintln!("moth: no Premium streams: yt-dlp took more than {}s", PREMIUM_TIMEOUT.as_secs());
+            return None;
+        }
+    };
+    if resolved.catalog.video.is_empty() && resolved.catalog.audio.is_empty() {
+        eprintln!("moth: yt-dlp found no Premium streams for this video");
+        return None;
+    }
+    let wait = resolved.usable_in();
+    if !wait.is_zero() {
+        tokio::time::sleep(wait).await;
+    }
+    Some(resolved.catalog)
+}
+
+/// Offer `premium`'s streams next to the catalog's own.
+fn add_premium(catalog: &mut StreamCatalog, premium: StreamCatalog) {
+    let before = (catalog.video.len(), catalog.audio.len());
+    for stream in premium.video {
+        if catalog.video_stream(stream.id).is_none() {
+            catalog.video.push(stream);
+        }
+    }
+    // The 256 kbps files have no audio tracks of their own: they belong to a video's only one.
+    let tracks = catalog.tracks();
+    if tracks.len() <= 1 {
+        for mut stream in premium.audio {
+            if !catalog.audio.iter().any(|known| itag(known.id) == itag(stream.id)) {
+                stream.track = tracks.first().cloned();
+                catalog.audio.push(stream);
+            }
+        }
+    }
+    if (catalog.video.len(), catalog.audio.len()) != before {
+        let added = (catalog.video.len() - before.0, catalog.audio.len() - before.1);
+        eprintln!("moth: added {} Premium video and {} Premium audio streams", added.0, added.1);
+        catalog.resolver_detail.push_str(" + Premium streams (yt-dlp)");
+    }
+}
+
 /// The recommendation account's home feed, if it's signed in.
 async fn signed_in_home(account: &account::Account) -> Option<Result<Vec<VideoSummary>>> {
     let (query, client) = account.query()?;
@@ -233,7 +305,9 @@ impl VideoSource for YouTube {
         let first = self.first;
         let ytdlp_format = self.ytdlp_format.clone();
         let playback = self.account(Role::Playback);
-        Box::pin(async move {
+        let premium_account = playback.clone();
+        let premium_id = id.clone();
+        let usual = async move {
             let mut failures = Vec::new();
             // YouTube wants a signed-in viewer (age-restricted, members-only, private, a bot check).
             let mut needs_sign_in = false;
@@ -293,6 +367,16 @@ impl VideoSource for YouTube {
                     bail!("{}", failures.join("\n"))
                 }
             }
+        };
+        Box::pin(async move {
+            // Premium's streams take yt-dlp a few seconds: ask for them while the usual ones
+            // resolve (this runs in the Tokio runtime, unlike the code that makes the future).
+            let premium = tokio::spawn(premium_streams(premium_account, premium_id));
+            let mut catalog = usual.await?;
+            if let Ok(Some(premium)) = premium.await {
+                add_premium(&mut catalog, premium);
+            }
+            Ok(catalog)
         })
     }
 
@@ -307,8 +391,12 @@ impl VideoSource for YouTube {
             None => itag(audio.id).to_string(),
         };
         let format = format!("{}+{audio_format}", itag(video.id));
+        // Premium's streams only resolve for the account that has them.
+        let cookies = (video.premium || PREMIUM_AUDIO_ITAGS.contains(&itag(audio.id)))
+            .then(|| self.account(Role::Playback).cookie_header())
+            .flatten();
         Some(Box::pin(async move {
-            let catalog = resolve_with_ytdlp(id, format, None).await?;
+            let catalog = resolve_with_ytdlp(id, format, cookies).await?;
             match (catalog.video.into_iter().next(), catalog.audio.into_iter().next()) {
                 (Some(video), Some(audio)) => Ok(AlternateUrls { video: video.location, audio: audio.location }),
                 _ => bail!("yt-dlp returned no alternate URLs"),
@@ -481,6 +569,7 @@ fn catalog(player: &VideoPlayer) -> StreamCatalog {
                 codec,
                 bitrate: Some(stream.average_bitrate),
                 size: stream.size,
+                premium: false,
             })
         })
         .collect();
@@ -581,6 +670,27 @@ mod tests {
         assert!(!is_video_id("PROGRAMMING"));
         assert!(!is_video_id("PlayStation"));
         assert!(!is_video_id("not an id"));
+    }
+
+    #[test]
+    fn premium_audio_joins_the_only_track() {
+        let mut catalog = StreamCatalog {
+            video: Vec::new(),
+            audio: vec![audio(251, Some("en"))],
+            resolver: "test",
+            resolver_detail: String::new(),
+            has_alternates: false,
+        };
+        let base = catalog.clone();
+        let premium = |itag| StreamCatalog { audio: vec![audio(itag, None)], ..base.clone() };
+        add_premium(&mut catalog, premium(774));
+        add_premium(&mut catalog, premium(774));
+        assert_eq!(catalog.audio.len(), 2);
+        assert_eq!(catalog.audio[1].track.as_ref().map(|track| track.id.as_str()), Some("en"));
+        // Several tracks (dubs): the premium audio can't tell which one it is.
+        catalog.audio.push(audio(251, Some("fr")));
+        add_premium(&mut catalog, premium(141));
+        assert_eq!(catalog.audio.len(), 3);
     }
 
     fn audio(itag: u64, track: Option<&str>) -> AudioStream {

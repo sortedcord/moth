@@ -273,6 +273,7 @@ impl Format {
             codec,
             bitrate: self.average_bitrate.or(self.bitrate),
             size,
+            premium: false,
         })
     }
 

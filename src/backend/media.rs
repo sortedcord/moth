@@ -180,6 +180,8 @@ pub struct VideoStream {
     /// Average bitrate, bits per second.
     pub bitrate: Option<u32>,
     pub size: Option<u64>,
+    /// A subscriber-only higher-bitrate version of a resolution (YouTube Premium's "Enhanced bitrate").
+    pub premium: bool,
 }
 
 impl VideoStream {
@@ -189,9 +191,15 @@ impl VideoStream {
         digits.parse().unwrap_or_else(|_| self.width.min(self.height))
     }
 
-    /// e.g. "1080p60", "720p".
+    /// e.g. "1080p60", "720p", "1080p60 Premium".
     pub fn label(&self) -> String {
-        quality_label(self.resolution(), self.fps)
+        let label = quality_label(self.resolution(), self.fps);
+        if self.premium { format!("{label} Premium") } else { label }
+    }
+
+    /// The codec, and whether this is the Premium version of it, e.g. "AV1 Premium".
+    pub fn format_label(&self) -> String {
+        if self.premium { format!("{} Premium", self.codec) } else { self.codec.to_string() }
     }
 }
 

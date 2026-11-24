@@ -27,6 +27,12 @@ impl StreamPreferences {
     fn codec_rank(&self, codec: VideoCodec) -> usize {
         self.video_codecs.iter().position(|preferred| *preferred == codec).unwrap_or(self.video_codecs.len())
     }
+
+    /// Premium versions beat the codec order (they usually come in one codec only, so ranking
+    /// codecs first would never pick them), but not a codec the user left out.
+    fn premium_rank(&self, stream: &VideoStream) -> bool {
+        !(stream.premium && self.video_codecs.contains(&stream.codec))
+    }
 }
 
 /// How good music should sound, as YouTube Music puts it: a tier rather than a stream, since
@@ -76,10 +82,12 @@ impl StreamCatalog {
         Some(Selection { video: Some(video), audio: self.auto_audio(preferences, None)?.id })
     }
 
-    /// Best stream at or below the preferred height, preferring `keep_codec` (if given) and then
-    /// the preferred codec order; if nothing is that small, the smallest stream.
+    /// Best stream at or below the preferred height, preferring Premium, then `keep_codec` (if
+    /// given) and then the preferred codec order; if nothing is that small, the smallest stream.
     pub fn auto_video(&self, preferences: &StreamPreferences, keep_codec: Option<VideoCodec>) -> Option<&VideoStream> {
-        let rank = |stream: &VideoStream| (Some(stream.codec) != keep_codec, preferences.codec_rank(stream.codec));
+        let rank = |stream: &VideoStream| {
+            (preferences.premium_rank(stream), Some(stream.codec) != keep_codec, preferences.codec_rank(stream.codec))
+        };
         let fitting = self.video.iter().filter(|stream| stream.resolution() <= preferences.max_height);
         let best = fitting.clone().map(|stream| (stream.resolution(), stream.fps)).max();
         match best {
@@ -90,11 +98,12 @@ impl StreamCatalog {
         }
     }
 
-    /// Video streams with the given resolution and frame rate, preferred codec first.
+    /// Video streams with the given resolution and frame rate, preferred codec first (Premium
+    /// before the regular version of a codec).
     pub fn video_variants(&self, resolution: u32, fps: u8, preferences: &StreamPreferences) -> Vec<&VideoStream> {
         let mut variants: Vec<_> =
             self.video.iter().filter(|stream| stream.resolution() == resolution && stream.fps == fps).collect();
-        variants.sort_by_key(|stream| preferences.codec_rank(stream.codec));
+        variants.sort_by_key(|stream| (preferences.codec_rank(stream.codec), !stream.premium));
         variants
     }
 
@@ -161,6 +170,7 @@ mod tests {
             codec,
             bitrate: None,
             size: None,
+            premium: false,
         }
     }
 
@@ -213,6 +223,28 @@ mod tests {
         // Nothing small enough: the smallest stream.
         preferences.max_height = 240;
         assert_eq!(catalog.auto_video(&preferences, None).map(|v| v.id), Some(StreamId(5)));
+    }
+
+    #[test]
+    fn premium_beats_the_codec_order_but_not_an_unlisted_codec() {
+        let mut catalog = catalog();
+        // Premium 1080p in AV1; the regular 1080p is VP9, the preferred codec.
+        catalog.video.push(VideoStream { premium: true, ..video(6, "1080p", 60, VideoCodec::Av1) });
+        let mut preferences = StreamPreferences { max_height: 1080, ..Default::default() };
+        assert_eq!(catalog.auto_video(&preferences, None).map(|v| v.id), Some(StreamId(6)));
+        // Not above the height limit.
+        preferences.max_height = 720;
+        assert_eq!(catalog.auto_video(&preferences, None).map(|v| v.id), Some(StreamId(3)));
+        // A codec the user left out doesn't get picked for being Premium.
+        preferences.max_height = 1080;
+        preferences.video_codecs = vec![VideoCodec::Vp9, VideoCodec::H264];
+        assert_eq!(catalog.auto_video(&preferences, None).map(|v| v.id), Some(StreamId(1)));
+        // Premium comes before the regular stream of its codec.
+        preferences.video_codecs = vec![VideoCodec::Av1];
+        catalog.video.push(video(7, "1080p", 60, VideoCodec::Av1));
+        let variants: Vec<_> =
+            catalog.video_variants(1080, 60, &preferences).into_iter().map(|stream| stream.id.0).collect();
+        assert_eq!(variants, [6, 7, 1]);
     }
 
     #[test]

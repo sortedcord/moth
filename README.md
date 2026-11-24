@@ -164,8 +164,13 @@ Metadata has the title, channel (`xesam:artist`), thumbnail, URL and length, plu
   the video); moth waits that out, so on this path a far seek right after opening a video can take a while.
 - Videos YouTube only plays to a signed-in viewer (age-restricted, members-only) go through the playback
   account: yt-dlp, signed in with its browser session's cookies (from a temporary private file). A playback
-  account signed in with a code can't play those yet: the TV app only gets SABR streams for them (#11), as
-  do Premium's higher-bitrate formats.
+  account signed in with a code can't play those yet: the TV app only gets SABR streams for them (#11).
+- Premium's higher-bitrate streams (1080p Premium video, 256 kbps audio, also on YouTube Music) come from the
+  playback account too, if it's a browser session of a Premium account (a code sign-in can't). While the usual
+  streams resolve, yt-dlp asks YouTube's TV client, signed in with the session, for the Premium ones, which are
+  plain HTTPS files (no SABR needed, #17). They're added to the catalog; automatic quality prefers Premium video
+  at its resolution (unless its codec isn't in your codec list) and the highest-bitrate audio. That makes a
+  video start a few seconds later; if yt-dlp can't find them, the usual streams play.
 - The recommendation account's home feed comes from the TV app (code sign-in) or the web (browser session);
   while a video plays, moth reports progress to its watch history the way YouTube's apps do.
 

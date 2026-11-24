@@ -41,6 +41,8 @@ pub fn format_for(preferences: &StreamPreferences) -> String {
 #[derive(Deserialize)]
 struct Info {
     requested_formats: Option<Vec<Format>>,
+    /// Every format yt-dlp found (only printed when no format was asked for, see [`premium`]).
+    formats: Option<Vec<Format>>,
 }
 
 #[derive(Deserialize)]
@@ -63,6 +65,8 @@ struct Format {
     http_headers: BTreeMap<String, String>,
     /// Unix time from which YouTube serves the URL (see [`Resolved::usable_in`]).
     available_at: Option<f64>,
+    /// `https` for plain files, `m3u8_native` and the like for playlists.
+    protocol: Option<String>,
 }
 
 impl Format {
@@ -117,6 +121,68 @@ pub fn resolve(video_id: &str, format: &str, cookies: Option<&Path>) -> Result<R
     parse(&output.stdout)
 }
 
+/// The Premium-only streams of a video, for the session in `cookies` (a Netscape cookies file):
+/// the enhanced-bitrate video (1080p Premium) and the 256 kbps audio YouTube Music offers. The
+/// catalog has whichever of them the video has, and may be empty. Blocking; run it on a
+/// blocking thread.
+///
+/// yt-dlp gets these from YouTube's TV client, signed in with the session, as plain HTTPS
+/// URLs: Premium formats don't need SABR after all (#17).
+pub fn premium(video_id: &str, cookies: &Path) -> Result<Resolved> {
+    let output = Command::new("nice")
+        .args(["-n", "10", "yt-dlp", "--no-warnings", "--no-playlist", "--ignore-no-formats-error", "-J", "--cookies"])
+        .arg(cookies)
+        .args(["--", video_id])
+        .output()
+        .context("failed to run yt-dlp")?;
+    if !output.status.success() {
+        bail!("yt-dlp: {}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    parse_premium(&output.stdout)
+}
+
+/// iTags of the 256 kbps audio (AAC and Opus), which are plain files like any other, only
+/// offered to Premium accounts.
+const PREMIUM_AUDIO: [&str; 2] = ["141", "774"];
+
+/// Pick the Premium streams out of `yt-dlp -J`.
+fn parse_premium(json: &[u8]) -> Result<Resolved> {
+    let info: Info = serde_json::from_slice(json).context("unexpected yt-dlp output")?;
+    let formats = info.formats.unwrap_or_default();
+    let available_at = latest_available_at(&formats);
+    let has = |codec: &Option<String>| codec.as_deref().is_some_and(|codec| codec != "none");
+    let mut video = Vec::new();
+    let mut audio = Vec::new();
+    for format in formats {
+        if format.protocol.as_deref() != Some("https") {
+            continue;
+        }
+        if has(&format.vcodec) && format.format_note.as_deref().is_some_and(|note| note.contains("Premium")) {
+            // An unsupported codec only drops that stream.
+            video.extend(video_stream(format).ok());
+        } else if has(&format.acodec) && !has(&format.vcodec) && PREMIUM_AUDIO.contains(&format.format_id.as_str()) {
+            audio.extend(audio_stream(format).ok());
+        }
+    }
+    let catalog = StreamCatalog {
+        video,
+        audio,
+        resolver: "yt-dlp",
+        resolver_detail: "yt-dlp (Premium)".to_string(),
+        has_alternates: false,
+    };
+    Ok(Resolved { catalog, available_at })
+}
+
+fn latest_available_at(formats: &[Format]) -> Option<SystemTime> {
+    formats
+        .iter()
+        .filter_map(|format| format.available_at)
+        .reduce(f64::max)
+        .and_then(|at| Duration::try_from_secs_f64(at).ok())
+        .map(|at| SystemTime::UNIX_EPOCH + at)
+}
+
 /// A session's cookies as a Netscape cookies file for yt-dlp: private to the user, in the
 /// runtime directory, and deleted when dropped.
 pub struct CookieFile(std::path::PathBuf);
@@ -168,12 +234,7 @@ fn parse(json: &[u8]) -> Result<Resolved> {
     let formats = info
         .requested_formats
         .ok_or_else(|| anyhow!("yt-dlp picked a combined stream; moth needs separate video and audio"))?;
-    let available_at = formats
-        .iter()
-        .filter_map(|format| format.available_at)
-        .reduce(f64::max)
-        .and_then(|at| Duration::try_from_secs_f64(at).ok())
-        .map(|at| SystemTime::UNIX_EPOCH + at);
+    let available_at = latest_available_at(&formats);
     let mut video = Vec::new();
     let mut audio = Vec::new();
     for format in formats {
@@ -216,6 +277,7 @@ fn video_stream(mut format: Format) -> Result<VideoStream> {
         other => bail!("unsupported video codec from yt-dlp: {other}"),
     };
     let (width, height) = (format.width.unwrap_or(0), format.height.unwrap_or(0));
+    let premium = format.format_note.as_deref().is_some_and(|note| note.contains("Premium"));
     Ok(VideoStream {
         id: stream_id(&format.format_id),
         location: format.location(),
@@ -226,6 +288,7 @@ fn video_stream(mut format: Format) -> Result<VideoStream> {
         codec,
         bitrate: bitrate(format.tbr),
         size: format.filesize,
+        premium,
     })
 }
 
@@ -290,6 +353,34 @@ mod tests {
         assert_eq!(video.location.headers, [("User-Agent".to_string(), "Mozilla/5.0".to_string())]);
         assert_eq!((audio.id, audio.codec, audio.bitrate), (StreamId(251), AudioCodec::Opus, Some(129_725)));
         assert_eq!(resolved.usable_in(), Duration::ZERO);
+    }
+
+    #[test]
+    fn picks_premium_streams_from_all_formats() {
+        let json = r#"{"formats": [
+            {"format_id": "399", "protocol": "https", "url": "https://x/399", "vcodec": "av01.0.08M.08",
+             "acodec": "none", "width": 1920, "height": 1080, "fps": 24, "tbr": 1142, "format_note": "1080p"},
+            {"format_id": "721", "protocol": "https", "url": "https://x/721", "vcodec": "av01.0.09M.08",
+             "acodec": "none", "width": 1920, "height": 1080, "fps": 60, "tbr": 4894.95,
+             "filesize": 350090532, "format_note": "1080p60 Premium",
+             "http_headers": {"User-Agent": "Mozilla/5.0"}},
+            {"format_id": "616", "protocol": "m3u8_native", "url": "https://x/616", "vcodec": "vp09.00.40.08",
+             "acodec": "none", "width": 1920, "height": 1080, "fps": 24, "format_note": "1080p Premium"},
+            {"format_id": "251", "protocol": "https", "url": "https://x/251", "vcodec": "none",
+             "acodec": "opus", "tbr": 129, "format_note": "medium"},
+            {"format_id": "774", "protocol": "https", "url": "https://x/774", "vcodec": "none",
+             "acodec": "opus", "tbr": 257, "format_note": "high"},
+            {"format_id": "774-drc", "protocol": "https", "url": "https://x/774d", "vcodec": "none",
+             "acodec": "opus", "tbr": 257, "format_note": "high, DRC"}
+        ]}"#;
+        let catalog = parse_premium(json.as_bytes()).expect("parses").catalog;
+        let video: Vec<_> = catalog.video.iter().map(|stream| (stream.id, stream.premium, stream.fps)).collect();
+        assert_eq!(video, [(StreamId(721), true, 60)]);
+        assert_eq!(catalog.video[0].location.headers, [("User-Agent".to_string(), "Mozilla/5.0".to_string())]);
+        let audio: Vec<_> = catalog.audio.iter().map(|stream| (stream.id, stream.codec)).collect();
+        assert_eq!(audio, [(StreamId(774), AudioCodec::Opus)]);
+        // A video without any gives an empty catalog, not an error.
+        assert!(parse_premium(br#"{"formats": []}"#).expect("parses").catalog.video.is_empty());
     }
 
     #[test]
