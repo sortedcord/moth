@@ -33,7 +33,7 @@ pub fn render(home: &MusicHome, images: &Entity<ImageCache>, cx: &mut Context<Ap
             div().flex().flex_col().gap_8().pb_6().children(rendered).into_any_element()
         }
     };
-    div().id("music-scroll").flex_1().min_h_0().overflow_y_scroll().child(content)
+    div().id("music-scroll").flex_1().min_h_0().overflow_y_scroll().restrict_scroll_to_axis().child(content)
 }
 
 fn notice(text: impl Into<SharedString>) -> impl IntoElement {
@@ -75,7 +75,16 @@ fn render_shelf(
         .flex_col()
         .gap_3()
         .child(div().text_xl().font_weight(FontWeight::BOLD).text_color(rgb(TEXT)).child(shelf.title.clone()))
-        .child(div().id(("music-shelf", ix)).overflow_x_scroll().flex().gap_4().pb_2().children(children))
+        .child(
+            div()
+                .id(("music-shelf", ix))
+                .overflow_x_scroll()
+                .restrict_scroll_to_axis()
+                .flex()
+                .gap_4()
+                .pb_2()
+                .children(children),
+        )
 }
 
 fn line(text: impl Into<SharedString>) -> gpui::Div {
