@@ -110,6 +110,7 @@ fn items(page: MenuPage, session: &PlaybackSession, settings: &Settings) -> Vec<
                 vec![item("Auto", Some(format!("up to {}p", settings.max_height)), auto, MenuAction::Quality(None))];
             items.extend(catalog.qualities().into_iter().map(|(resolution, fps)| {
                 let badge = match resolution {
+                    _ if catalog.has_premium(resolution, fps) => Some("Premium".to_string()),
                     2160.. => Some("4K".to_string()),
                     1440.. => Some("QHD".to_string()),
                     720.. => Some("HD".to_string()),

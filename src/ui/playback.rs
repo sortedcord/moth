@@ -562,10 +562,7 @@ impl PlaybackSession {
         let codec: Option<VideoCodec> = self.video_stream().map(|video| video.codec);
         let video = match quality {
             None => catalog.auto_video(&preferences, codec),
-            Some((resolution, fps)) => {
-                let variants = catalog.video_variants(resolution, fps, &preferences);
-                variants.iter().find(|video| Some(video.codec) == codec).or(variants.first()).copied()
-            }
+            Some((resolution, fps)) => catalog.video_for_quality(resolution, fps, codec, &preferences),
         };
         self.quality_auto = quality.is_none();
         if let Some(video) = video {

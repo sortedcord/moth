@@ -107,6 +107,28 @@ impl StreamCatalog {
         variants
     }
 
+    /// The stream to play for a chosen quality: Premium if there is one (as in
+    /// [`Self::auto_video`]), else the one in `keep_codec`, else the preferred codec.
+    pub fn video_for_quality(
+        &self,
+        resolution: u32,
+        fps: u8,
+        keep_codec: Option<VideoCodec>,
+        preferences: &StreamPreferences,
+    ) -> Option<&VideoStream> {
+        let variants = self.video_variants(resolution, fps, preferences);
+        let premium = variants.iter().find(|stream| !preferences.premium_rank(stream));
+        premium
+            .or_else(|| variants.iter().find(|stream| Some(stream.codec) == keep_codec))
+            .or(variants.first())
+            .copied()
+    }
+
+    /// Whether the quality has a Premium stream.
+    pub fn has_premium(&self, resolution: u32, fps: u8) -> bool {
+        self.video.iter().any(|stream| stream.premium && stream.resolution() == resolution && stream.fps == fps)
+    }
+
     /// Distinct (resolution, fps) pairs, highest first.
     pub fn qualities(&self) -> Vec<(u32, u8)> {
         let mut qualities: Vec<_> = self.video.iter().map(|stream| (stream.resolution(), stream.fps)).collect();
@@ -245,6 +267,9 @@ mod tests {
         let variants: Vec<_> =
             catalog.video_variants(1080, 60, &preferences).into_iter().map(|stream| stream.id.0).collect();
         assert_eq!(variants, [6, 7, 1]);
+        // Choosing the quality by hand gets Premium too, whatever the current codec.
+        assert_eq!(catalog.video_for_quality(1080, 60, Some(VideoCodec::Vp9), &preferences).map(|v| v.id.0), Some(6));
+        assert!(catalog.has_premium(1080, 60) && !catalog.has_premium(720, 60));
     }
 
     #[test]
