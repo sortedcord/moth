@@ -20,6 +20,9 @@ a browser extension that sends YouTube links to it.
 - **Search and paste anything.** Search YouTube (or YouTube Music when on the Music tab) with autocomplete
   suggestions and pagination, or paste watch, `youtu.be` and Shorts links or bare video IDs in the top bar
   (links with a timestamp start there); video details, description and related videos on the watch page.
+- **Channel pages.** Click a channel's name on the watch page, home, search results or up next, or paste a
+  channel link or `@handle` in the top bar: banner, subscriber count, description, and the channel's videos
+  (latest or most popular first, with pagination). Subscribe and unsubscribe with the recommendation account.
 - **Desktop integration.** An MPRIS player for media keys, shells and `playerctl`; `moth status [--watch]`
   for status bars; single-instance handoff, so `moth <url>` opens the link in the running window.
 - **Browser handoff.** A Chromium extension that opens YouTube links in moth instead of the browser.
@@ -178,6 +181,12 @@ Metadata has the title, channel (`xesam:artist`), thumbnail, URL and length, plu
   plain HTTPS files (no SABR needed, #17). They're added to the catalog; automatic quality prefers Premium video
   at its resolution (unless its codec isn't in your codec list) and the highest-bitrate audio. That makes a
   video start a few seconds later; if yt-dlp can't find them, the usual streams play.
+- Channel pages are read from YouTube's web browse responses by moth itself (RustyPipe 0.11.4 misreads the new
+  channel header and its sort orders): the Videos tab's header and videos, with the sort chips' continuation
+  tokens for Popular. Subscribing goes through `subscription/subscribe` with the recommendation account (a code
+  or a browser sign-in alike). YouTube's pages report a new subscription a few seconds late, so moth remembers
+  what you just changed for a minute. The TV app's home feed names channels without their ids: moth looks the
+  channel up from the video when you click one.
 - The recommendation account's home feed comes from the TV app (code sign-in) or the web (browser session);
   while a video plays, moth reports progress to its watch history the way YouTube's apps do.
 
@@ -208,7 +217,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the architecture, debug tools 
   - `media.rs`, `selection.rs`: the site-neutral model (videos, streams, codecs) and stream selection
   - `player/`: the GStreamer pipeline, the ranged HTTP source and the Wayland embedding
 - `src/ui/`: the gpui frontend: `mod.rs` (window, navigation, top bar), `playback.rs` (the playback session),
-  `watch/`, `home.rs` + `layout.rs` (spring-animated grid), `settings_page.rs`, `actions.rs` (keyboard shortcuts)
+  `watch/`, `channel_page.rs`, `home.rs` + `layout.rs` (spring-animated grid), `settings_page.rs`, `actions.rs` (keyboard shortcuts)
 - `src/desktop/`: the instance socket and `moth status`, MPRIS, and the browser extension's native host
 - `src/settings.rs`: persisted settings; `src/dev.rs`: `MOTH_*` developer options
 - `extension/`: the "Open in moth" browser extension and its native-host installer

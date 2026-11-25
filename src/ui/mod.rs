@@ -6,6 +6,7 @@
 
 mod accounts;
 mod actions;
+mod channel_page;
 mod components;
 mod format;
 mod home;
@@ -38,7 +39,7 @@ use gpui::{
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
 
 use crate::backend::Backend;
-use crate::backend::media::{Link, VideoRef, VideoSummary};
+use crate::backend::media::{ChannelRef, ChannelTarget, Link, VideoRef, VideoSummary};
 use crate::backend::music::{MusicSearchFilter, PlayTarget};
 use crate::backend::player::WaylandTarget;
 use crate::desktop::status::{Hub, NowPlaying, Page, QueueInfo, VideoInfo};
@@ -49,6 +50,7 @@ use actions::{
     APP, Cancel, CycleFrameOverlay, FocusAddress, GoHome, OpenMusic, OpenSettings, ToggleLayoutTargets,
     ToggleSlowMotion,
 };
+use channel_page::{ChannelEvent, ChannelPage};
 use icons::{Icon, icon};
 use images::ImageCache;
 use layout::HomeLayout;
@@ -58,7 +60,7 @@ use search_page::{SearchEvent, VideoSearchPage};
 use suggestions::{Suggestion, SuggestionsPopup};
 use text_input::{Change, Step, Submit, TextInput};
 use theme::{ACCENT, BG_BOTTOM, BG_TOP, FAINT, FOCUS_RING, FONT, HOVER, MUTED, PAD, PANEL, TEXT, VIDEO_BG};
-use watch::{OpenVideo, WatchPage};
+use watch::{OpenChannel, OpenVideo, WatchPage};
 
 impl Global for Settings {}
 impl Global for DevOptions {}
@@ -149,6 +151,7 @@ enum Route {
     Search(Entity<VideoSearchPage>),
     Music,
     MusicSearch(Entity<MusicSearchPage>),
+    Channel(Entity<ChannelPage>),
     /// The expanded music player.
     Player,
     Watch(Entity<WatchPage>),
@@ -157,6 +160,12 @@ enum Route {
 
 const YOUTUBE_PLACEHOLDER: &str = "Search YouTube or paste a link";
 const MUSIC_PLACEHOLDER: &str = "Search YouTube Music or paste a link";
+
+/// Where a channel name in a list goes, if the video's site has channel pages.
+pub(super) fn channel_link(video: &VideoSummary, cx: &App) -> Option<ChannelTarget> {
+    let target = video.channel_target()?;
+    cx.global::<BackendHandle>().0.has_channels(video.video.source).then_some(target)
+}
 
 pub struct AppView {
     route: Route,
@@ -178,6 +187,8 @@ pub struct AppView {
     music_home: Option<music_page::MusicHome>,
     /// Where leaving the watch page goes back to (e.g. search results).
     before_watch: Option<Route>,
+    /// Where leaving a channel page goes back to (home or search results).
+    before_channel: Option<Route>,
     /// Where closing the expanded player goes back to.
     before_player: Option<Route>,
     music_seek: watch::BoundsTracker,
@@ -195,6 +206,7 @@ pub struct AppView {
     _feed: Option<Task<()>>,
     _search_subscription: Option<Subscription>,
     _music_search_subscription: Option<Subscription>,
+    _channel_subscription: Option<Subscription>,
     _page_subscriptions: Vec<Subscription>,
     _subscriptions: Vec<Subscription>,
     _commands: Task<()>,
@@ -307,6 +319,7 @@ impl AppView {
             feed_status: FeedStatus::Loading,
             music_home: None,
             before_watch: None,
+            before_channel: None,
             before_player: None,
             music_seek: Default::default(),
             _music_home: None,
@@ -320,6 +333,7 @@ impl AppView {
             _feed: None,
             _search_subscription: None,
             _music_search_subscription: None,
+            _channel_subscription: None,
             _page_subscriptions: Vec::new(),
             _subscriptions: subscriptions,
             _commands: commands,
@@ -516,7 +530,21 @@ impl AppView {
             return;
         }
         let backend = cx.global::<BackendHandle>().0.clone();
-        if backend.claims(&trimmed) {
+        if backend.claims_channel(&trimmed) {
+            let resolve = backend.resolve_channel(trimmed);
+            self._resolve = Some(cx.spawn_in(window, async move |this, cx| {
+                let result = resolve.await;
+                this.update_in(cx, |this, window, cx| match result {
+                    Ok(channel) => this.open_channel(channel, window, cx),
+                    Err(err) => {
+                        this.address_error = Some(format!("{err:#}").into());
+                        cx.notify();
+                    }
+                })
+                .ok();
+            }));
+            cx.notify();
+        } else if backend.claims(&trimmed) {
             let resolve = backend.resolve(trimmed);
             self._resolve = Some(cx.spawn_in(window, async move |this, cx| {
                 let result = resolve.await;
@@ -552,6 +580,7 @@ impl AppView {
                     this.before_watch = Some(this.route.clone());
                     this.open_video(video.clone(), window, cx);
                 }
+                SearchEvent::OpenChannel(channel) => this.open_channel_target(channel.clone(), window, cx),
                 SearchEvent::GoHome => this.go_home(window, cx),
             }));
         self.route = Route::Search(page);
@@ -579,6 +608,69 @@ impl AppView {
         cx.notify();
     }
 
+    /// Open a channel, looking it up from a video first if need be.
+    pub(super) fn open_channel_target(&mut self, target: ChannelTarget, window: &mut Window, cx: &mut Context<Self>) {
+        match target {
+            ChannelTarget::Channel(channel) => self.open_channel(channel, window, cx),
+            ChannelTarget::OfVideo(video) => {
+                let lookup = cx.global::<BackendHandle>().0.channel_of(&video);
+                self._resolve = Some(cx.spawn_in(window, async move |this, cx| {
+                    let result = lookup.await;
+                    this.update_in(cx, |this, window, cx| match result {
+                        Ok(channel) => this.open_channel(channel, window, cx),
+                        Err(err) => {
+                            this.address_error = Some(format!("{err:#}").into());
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                }));
+            }
+        }
+    }
+
+    /// Open a channel's page. Back goes to the home page or search results it was opened from;
+    /// from a watch page (whose video stops) back goes home.
+    fn open_channel(&mut self, channel: ChannelRef, window: &mut Window, cx: &mut Context<Self>) {
+        let from = match &self.route {
+            Route::Home | Route::Search(_) => Some(self.route.clone()),
+            Route::Channel(_) => self.before_channel.take(),
+            _ => None,
+        };
+        self.leave_watch(window, cx);
+        self.before_watch = None;
+        self.before_channel = from;
+        let images = self.images.clone();
+        let page = cx.new(|cx| ChannelPage::new(channel, images, cx));
+        self._channel_subscription =
+            Some(cx.subscribe_in(&page, window, |this, _, event: &ChannelEvent, window, cx| match event {
+                ChannelEvent::OpenVideo(video) => {
+                    this.before_watch = Some(this.route.clone());
+                    this.open_video(video.clone(), window, cx);
+                }
+                ChannelEvent::GoBack => this.leave_channel(window, cx),
+            }));
+        self.route = Route::Channel(page);
+        self.sync_address_placeholder(cx);
+        window.focus(&self.focus, cx);
+        self.publish(window, cx);
+        cx.notify();
+    }
+
+    fn leave_channel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.before_channel.take() {
+            Some(Route::Search(page)) => {
+                let query = page.read(cx).query().to_string();
+                self.address.update(cx, |input, cx| input.set_text(query, window, cx));
+                self.route = Route::Search(page);
+                self.sync_address_placeholder(cx);
+                self.publish(window, cx);
+                cx.notify();
+            }
+            _ => self.go_home(window, cx),
+        }
+    }
+
     fn open_video(&mut self, video: VideoRef, window: &mut Window, cx: &mut Context<Self>) {
         self.open_video_at(video, None, window, cx);
     }
@@ -597,6 +689,9 @@ impl AppView {
         self._page_subscriptions = vec![
             cx.subscribe_in(&page, window, |this, _, event: &OpenVideo, window, cx| {
                 this.open_video(event.0.clone(), window, cx);
+            }),
+            cx.subscribe_in(&page, window, |this, _, event: &OpenChannel, window, cx| {
+                this.open_channel_target(event.0.clone(), window, cx);
             }),
             // Title and channel arrive with the details.
             cx.observe_in(&page, window, |this, _, window, cx| this.publish(window, cx)),
@@ -622,16 +717,19 @@ impl AppView {
     }
 
     fn leave_watch_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(Route::Search(page)) = self.before_watch.take() {
-            self.leave_watch(window, cx);
-            let query = page.read(cx).query().to_string();
-            self.address.update(cx, |input, cx| input.set_text(query, window, cx));
-            self.route = Route::Search(page);
-            self.sync_address_placeholder(cx);
-            self.publish(window, cx);
-            cx.notify();
-        } else {
-            self.go_home(window, cx);
+        match self.before_watch.take() {
+            Some(route @ (Route::Search(_) | Route::Channel(_))) => {
+                self.leave_watch(window, cx);
+                if let Route::Search(page) = &route {
+                    let query = page.read(cx).query().to_string();
+                    self.address.update(cx, |input, cx| input.set_text(query, window, cx));
+                }
+                self.route = route;
+                self.sync_address_placeholder(cx);
+                self.publish(window, cx);
+                cx.notify();
+            }
+            _ => self.go_home(window, cx),
         }
     }
 
@@ -840,7 +938,7 @@ impl AppView {
         NowPlaying {
             running: true,
             page: match self.route {
-                Route::Home | Route::Search(_) => Page::Home,
+                Route::Home | Route::Search(_) | Route::Channel(_) => Page::Home,
                 Route::Music | Route::MusicSearch(_) | Route::Player => Page::Music,
                 Route::Watch(_) => Page::Watch,
                 Route::Settings => Page::Settings,
@@ -910,7 +1008,11 @@ impl AppView {
     // ── Rendering ────────────────────────────────────────────────────────────
 
     fn top_bar(&self, back: bool, address_focused: bool, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let back_label = if matches!(self.before_watch, Some(Route::Search(_))) { "← Search" } else { "← Home" };
+        let back_label = match self.before_watch {
+            Some(Route::Search(_)) => "← Search",
+            Some(Route::Channel(_)) => "← Channel",
+            _ => "← Home",
+        };
         let has_text = !self.address.read(cx).text().is_empty();
         let suggestions_open = self.suggestions.is_some();
         div()
@@ -1026,13 +1128,20 @@ impl Render for AppView {
                 .gap_4()
                 .child(self.top_bar(true, address_focused, cx))
                 .child(page.clone()),
-            Route::Home | Route::Search(_) | Route::Settings | Route::Music | Route::MusicSearch(_) | Route::Player => {
+            Route::Home
+            | Route::Search(_)
+            | Route::Channel(_)
+            | Route::Settings
+            | Route::Music
+            | Route::MusicSearch(_)
+            | Route::Player => {
                 let animate = cx.global::<Settings>().animations_enabled(cx.reduce_motion());
                 if self.layout.step(viewport_w, animate) {
                     window.request_animation_frame();
                 }
                 let (entry, content) = match &self.route {
                     Route::Search(page) => (sidebar::Entry::Home, page.clone().into_any_element()),
+                    Route::Channel(page) => (sidebar::Entry::Home, page.clone().into_any_element()),
                     Route::Music => (
                         sidebar::Entry::Music,
                         match &self.music_home {

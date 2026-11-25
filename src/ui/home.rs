@@ -8,7 +8,7 @@ use super::components::thumbnail;
 use super::format;
 use super::images::ImageCache;
 use super::layout::{self, HomeLayout};
-use super::theme::{ACCENT, HOVER, MUTED, TRACK};
+use super::theme::{ACCENT, HOVER, MUTED, TEXT, TRACK};
 use super::{AppView, FeedStatus};
 use crate::backend::media::VideoSummary;
 
@@ -95,15 +95,42 @@ fn card(
 ) -> impl IntoElement + use<> {
     let line = || div().px_2().whitespace_nowrap().overflow_hidden().text_ellipsis();
     let target = video.video.clone();
-    let meta = [
-        video.channel.clone(),
-        video.views.map(|views| format!("{} views", format::compact_count(views))),
-        video.age.clone(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join(" · ");
+    let channel_ref = super::channel_link(video, cx);
+    let rest = [video.views.map(|views| format!("{} views", format::compact_count(views))), video.age.clone()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+    // The channel's name opens the channel (and not the video) when clicked.
+    let meta = div()
+        .px_2()
+        .flex()
+        .whitespace_nowrap()
+        .overflow_hidden()
+        .text_xs()
+        .text_color(rgb(MUTED))
+        .when_some(video.channel.clone(), |line, name| {
+            line.child(
+                div()
+                    .id(("card-channel", ix))
+                    .min_w_0()
+                    .truncate()
+                    .when_some(channel_ref, |link, channel| {
+                        link.cursor_pointer().hover(|style| style.text_color(rgb(TEXT))).on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.open_channel_target(channel.clone(), window, cx);
+                            },
+                        ))
+                    })
+                    .child(name),
+            )
+        })
+        .child(
+            div()
+                .flex_none()
+                .child(format!("{}{rest}", if video.channel.is_some() && !rest.is_empty() { " · " } else { "" })),
+        );
     div()
         .id(("card", ix))
         .absolute()
@@ -121,5 +148,5 @@ fn card(
         .on_click(cx.listener(move |this, _, window, cx| this.open_video(target.clone(), window, cx)))
         .child(thumbnail(image, video.duration.map(format::clock), px(w - 2.0), px(layout::thumb_h(w))))
         .child(line().pt_1().text_sm().child(video.title.clone()))
-        .child(line().text_xs().text_color(rgb(MUTED)).child(meta))
+        .child(meta)
 }

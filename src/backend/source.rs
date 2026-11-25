@@ -8,8 +8,8 @@ use std::pin::Pin;
 use anyhow::Result;
 
 use super::media::{
-    AlternateUrls, AudioStream, Link, SearchMore, SearchPage, StreamCatalog, VideoDetails, VideoStream, VideoSummary,
-    Watching,
+    AlternateUrls, AudioStream, ChannelDetails, ChannelMore, ChannelOrder, ChannelVideos, Link, SearchMore, SearchPage,
+    StreamCatalog, VideoDetails, VideoStream, VideoSummary, Watching,
 };
 use super::music::{
     MusicSearchFilter, MusicSearchMore, MusicSearchPage, MusicSearchSuggestions, MusicShelf, PlayTarget, QueuePage,
@@ -111,6 +111,47 @@ pub trait VideoSource: Send + Sync {
 
     /// Autocomplete suggestions for a partial video search query.
     fn search_suggestions(&self, _query: String) -> Option<BoxFuture<Vec<String>>> {
+        None
+    }
+
+    /// Whether `input` looks like a link to one of the site's channels (or a handle such as
+    /// `@name`), as opposed to a video.
+    fn claims_channel(&self, _input: &str) -> bool {
+        false
+    }
+
+    /// The id of the channel a link or handle points at.
+    fn resolve_channel(&self, _input: String) -> Option<BoxFuture<String>> {
+        None
+    }
+
+    /// Whether the site has channel pages (the UI only makes channel names links if so).
+    fn has_channels(&self) -> bool {
+        false
+    }
+
+    /// The id of the channel that posted a video.
+    fn channel_of(&self, _video_id: String) -> Option<BoxFuture<String>> {
+        None
+    }
+
+    /// A channel's page, with its latest videos.
+    fn channel(&self, _id: String) -> Option<BoxFuture<ChannelDetails>> {
+        None
+    }
+
+    /// A channel's videos in the given order.
+    fn channel_videos(&self, _id: String, _order: ChannelOrder) -> Option<BoxFuture<ChannelVideos>> {
+        None
+    }
+
+    /// Next page of a channel's videos (see [`ChannelVideos::more`]).
+    fn channel_videos_more(&self, _more: ChannelMore) -> Option<BoxFuture<ChannelVideos>> {
+        None
+    }
+
+    /// Subscribe the signed-in account to a channel, or unsubscribe it.
+    fn subscribe(&self, _channel_id: String, _subscribed: bool) -> Option<BoxFuture<()>> {
         None
     }
 

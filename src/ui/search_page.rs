@@ -7,11 +7,12 @@ use super::components::{avatar, chip, thumbnail};
 use super::format;
 use super::images::ImageCache;
 use super::theme::{ACCENT, FAINT, HOVER, MUTED, PANEL, TEXT};
-use crate::backend::media::{SearchMore, SearchPage, VideoRef, VideoSummary};
+use crate::backend::media::{ChannelTarget, SearchMore, SearchPage, VideoRef, VideoSummary};
 use crate::settings::Settings;
 
 pub enum SearchEvent {
     OpenVideo(VideoRef),
+    OpenChannel(ChannelTarget),
     GoHome,
 }
 
@@ -249,12 +250,22 @@ fn row(
                 )
                 .when(!meta.is_empty(), |col| col.child(div().text_xs().text_color(rgb(MUTED)).child(meta)))
                 .when_some(video.channel.clone(), |col, channel| {
+                    let channel_ref = super::channel_link(video, cx);
                     col.child(
                         div()
+                            .id(("search-channel", ix))
                             .flex()
                             .items_center()
                             .gap_2()
                             .py_0p5()
+                            .when_some(channel_ref, |link, channel| {
+                                link.cursor_pointer().hover(|style| style.text_color(rgb(TEXT))).on_click(cx.listener(
+                                    move |_, _, _, cx| {
+                                        cx.stop_propagation();
+                                        cx.emit(SearchEvent::OpenChannel(channel.clone()));
+                                    },
+                                ))
+                            })
                             .child(match channel_avatar {
                                 Some(image) => img(image).size(px(22.0)).flex_none().rounded_full().into_any_element(),
                                 None => avatar(&channel, 22.0).into_any_element(),

@@ -44,6 +44,8 @@ pub struct VideoDetails {
 
 #[derive(Clone, Debug)]
 pub struct Channel {
+    /// The site's id for the channel, if it has channel pages ([`ChannelRef`]).
+    pub id: Option<String>,
     pub name: String,
     pub avatar_url: Option<String>,
     pub subscribers: Option<u64>,
@@ -66,6 +68,8 @@ pub struct VideoSummary {
     pub video: VideoRef,
     pub title: String,
     pub channel: Option<String>,
+    /// The site's id for the channel, if it has channel pages ([`ChannelRef`]).
+    pub channel_id: Option<String>,
     pub channel_avatar_url: Option<String>,
     pub views: Option<u64>,
     /// Relative age as the source words it, e.g. "3 years ago".
@@ -75,6 +79,84 @@ pub struct VideoSummary {
     pub description: Option<String>,
     /// Short-form vertical video (YouTube Shorts and the like).
     pub is_short: bool,
+}
+
+impl VideoSummary {
+    /// How to get to the channel that posted the video, if it names one. Some lists (the TV
+    /// app's home feed) only give the name; the channel is then looked up from the video.
+    pub fn channel_target(&self) -> Option<ChannelTarget> {
+        self.channel.as_ref()?;
+        Some(match &self.channel_id {
+            Some(id) => ChannelTarget::Channel(ChannelRef { source: self.video.source, id: id.clone() }),
+            None => ChannelTarget::OfVideo(self.video.clone()),
+        })
+    }
+}
+
+/// A channel to open: known, or the one that posted a video.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChannelTarget {
+    Channel(ChannelRef),
+    OfVideo(VideoRef),
+}
+
+/// A channel in a particular source, e.g. `youtube` / `UCHnyfMqiRRG1u-2MsSQLbXA`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ChannelRef {
+    pub source: &'static str,
+    pub id: String,
+}
+
+/// How a channel's videos are ordered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChannelOrder {
+    #[default]
+    Latest,
+    Popular,
+}
+
+impl ChannelOrder {
+    pub const ALL: [Self; 2] = [Self::Latest, Self::Popular];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Latest => "Latest",
+            Self::Popular => "Popular",
+        }
+    }
+}
+
+/// A channel's page: who it is, and its videos (latest first).
+#[derive(Clone, Debug)]
+pub struct ChannelDetails {
+    pub channel: ChannelRef,
+    pub name: String,
+    /// e.g. "@handle".
+    pub handle: Option<String>,
+    pub subscribers: Option<u64>,
+    pub video_count: Option<u64>,
+    pub avatar_url: Option<String>,
+    pub banner_url: Option<String>,
+    pub description: String,
+    pub verified: bool,
+    /// Whether the signed-in account follows the channel; `None` if nobody's signed in (or the
+    /// site couldn't say).
+    pub subscribed: Option<bool>,
+    pub videos: ChannelVideos,
+}
+
+/// One page of a channel's videos.
+#[derive(Clone, Debug)]
+pub struct ChannelVideos {
+    pub videos: Vec<VideoSummary>,
+    /// Fetches the next page (opaque to everyone but the source).
+    pub more: Option<ChannelMore>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChannelMore {
+    pub source: &'static str,
+    pub token: String,
 }
 
 /// One page of video search results.

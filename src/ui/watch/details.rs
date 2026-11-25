@@ -3,11 +3,11 @@
 use gpui::{Context, FontWeight, ImageSource, SharedString, div, img, prelude::*, px, rgb};
 
 use super::{Details, WatchPage};
-use crate::backend::media::{VideoDetails, VideoSummary};
+use crate::backend::media::{ChannelTarget, VideoDetails, VideoSummary};
 use crate::settings::Settings;
 use crate::ui::components::{avatar, pill, thumbnail};
 use crate::ui::format;
-use crate::ui::theme::{ACCENT, FAINT, HOVER, MUTED, PANEL};
+use crate::ui::theme::{ACCENT, FAINT, HOVER, MUTED, PANEL, TEXT};
 
 pub fn render(page: &WatchPage, cx: &mut Context<WatchPage>) -> gpui::AnyElement {
     let details = match &page.details {
@@ -34,6 +34,11 @@ pub fn render(page: &WatchPage, cx: &mut Context<WatchPage>) -> gpui::AnyElement
     };
     let avatar_image = details.channel.avatar_url.as_deref().and_then(|url| page.images.read(cx).get(url));
     let stats = stats_line(&details);
+    let channel = details
+        .channel
+        .id
+        .clone()
+        .map(|id| ChannelTarget::Channel(crate::backend::media::ChannelRef { source: page.video().source, id }));
 
     div()
         .flex()
@@ -47,23 +52,36 @@ pub fn render(page: &WatchPage, cx: &mut Context<WatchPage>) -> gpui::AnyElement
                 .flex_wrap()
                 .items_center()
                 .gap_3()
-                .child(match avatar_image {
-                    Some(image) => img(image).size(px(40.0)).flex_none().rounded_full().into_any_element(),
-                    None => avatar(&details.channel.name, 40.0).into_any_element(),
-                })
                 .child(
                     div()
+                        .id("watch-channel")
                         .flex()
-                        .flex_col()
-                        .child(div().font_weight(FontWeight::SEMIBOLD).child(details.channel.name.clone()))
-                        .when_some(details.channel.subscribers, |column, subscribers| {
-                            column.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .child(format!("{} subscribers", format::compact_count(subscribers))),
-                            )
-                        }),
+                        .items_center()
+                        .gap_3()
+                        .rounded_xl()
+                        .when_some(channel, |link, channel| {
+                            link.cursor_pointer()
+                                .hover(|style| style.bg(rgb(HOVER)))
+                                .on_click(cx.listener(move |_, _, _, cx| cx.emit(super::OpenChannel(channel.clone()))))
+                        })
+                        .child(match avatar_image {
+                            Some(image) => img(image).size(px(40.0)).flex_none().rounded_full().into_any_element(),
+                            None => avatar(&details.channel.name, 40.0).into_any_element(),
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(div().font_weight(FontWeight::SEMIBOLD).child(details.channel.name.clone()))
+                                .when_some(details.channel.subscribers, |column, subscribers| {
+                                    column.child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(MUTED))
+                                            .child(format!("{} subscribers", format::compact_count(subscribers))),
+                                    )
+                                }),
+                        ),
                 )
                 .child(div().flex_1())
                 .when_some(details.likes, |row, likes| {
@@ -154,8 +172,23 @@ fn recommendation(
                         .text_ellipsis()
                         .child(video.title.clone()),
                 )
-                .when_some(video.channel.clone(), |column, channel| {
-                    column.child(div().text_xs().text_color(rgb(MUTED)).child(channel))
+                .when_some(video.channel.clone(), |column, name| {
+                    let channel_ref = crate::ui::channel_link(video, cx);
+                    column.child(
+                        div()
+                            .id(("rec-channel", ix))
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .when_some(channel_ref, |link, channel| {
+                                link.cursor_pointer().hover(|style| style.text_color(rgb(TEXT))).on_click(cx.listener(
+                                    move |_, _, _, cx| {
+                                        cx.stop_propagation();
+                                        cx.emit(super::OpenChannel(channel.clone()));
+                                    },
+                                ))
+                            })
+                            .child(name),
+                    )
                 })
                 .when(!meta.is_empty(), |column| column.child(div().text_xs().text_color(rgb(FAINT)).child(meta))),
         )

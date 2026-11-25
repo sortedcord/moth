@@ -16,6 +16,7 @@
 
 mod account;
 pub use account::SessionExpired;
+mod channel;
 mod feed;
 mod history;
 mod music;
@@ -35,8 +36,9 @@ use rustypipe::model::{
 
 use super::accounts::{Method, Role};
 use super::media::{
-    AlternateUrls, AudioCodec, AudioStream, AudioTrack, Channel, Link, Location, Published, SearchMore, SearchPage,
-    StreamCatalog, StreamId, VideoCodec, VideoDetails, VideoRef, VideoStream, VideoSummary, Watching,
+    AlternateUrls, AudioCodec, AudioStream, AudioTrack, Channel, ChannelDetails, ChannelMore, ChannelOrder,
+    ChannelVideos, Link, Location, Published, SearchMore, SearchPage, StreamCatalog, StreamId, VideoCodec,
+    VideoDetails, VideoRef, VideoStream, VideoSummary, Watching,
 };
 use super::music::{
     MusicSearchFilter, MusicSearchMore, MusicSearchPage, MusicSearchSuggestions, MusicShelf, PlayTarget, QueuePage,
@@ -110,6 +112,8 @@ pub struct YouTube {
     /// Signed-in accounts, by role (see [`crate::backend::accounts`]).
     accounts: [Arc<account::Account>; 2],
     history: Arc<history::History>,
+    /// What the account just subscribed to or left: YouTube's pages report it a few seconds late.
+    subscriptions: Arc<channel::RecentSubscriptions>,
     http: reqwest::Client,
     /// Dev override: start the resolver chain further down.
     first: Resolver,
@@ -128,7 +132,15 @@ impl YouTube {
             Arc::new(account::Account::load(Role::Playback).await?),
             Arc::new(account::Account::load(Role::Recommendations).await?),
         ];
-        Ok(Self { client, accounts, history: Default::default(), http, first, ytdlp_format })
+        Ok(Self {
+            client,
+            accounts,
+            history: Default::default(),
+            subscriptions: Default::default(),
+            http,
+            first,
+            ytdlp_format,
+        })
     }
 
     pub fn account(&self, role: Role) -> Arc<account::Account> {
@@ -283,6 +295,7 @@ impl VideoSource for YouTube {
             Ok(VideoDetails {
                 title: details.name,
                 channel: Channel {
+                    id: Some(channel.id.clone()),
                     avatar_url: pick_thumbnail(&channel.avatar, 80),
                     subscribers: channel.subscriber_count,
                     name: channel.name,
@@ -479,6 +492,61 @@ impl VideoSource for YouTube {
         }))
     }
 
+    fn has_channels(&self) -> bool {
+        true
+    }
+
+    fn channel_of(&self, video_id: String) -> Option<BoxFuture<String>> {
+        let client = self.client.clone();
+        Some(Box::pin(async move { Ok(client.query().video_details(&video_id).await?.channel.id) }))
+    }
+
+    fn claims_channel(&self, input: &str) -> bool {
+        channel::claims(input)
+    }
+
+    fn resolve_channel(&self, input: String) -> Option<BoxFuture<String>> {
+        let client = self.client.clone();
+        Some(Box::pin(async move {
+            match client.query().resolve_string(&channel::normalize(&input), false).await {
+                Ok(UrlTarget::Channel { id }) => Ok(id),
+                Ok(_) => bail!("That isn't a link to a channel"),
+                Err(err) => bail!("Couldn't find that channel: {err}"),
+            }
+        }))
+    }
+
+    fn channel(&self, id: String) -> Option<BoxFuture<ChannelDetails>> {
+        let (client, account) = (self.client.clone(), self.account(Role::Recommendations));
+        let recent = self.subscriptions.clone();
+        Some(Box::pin(async move {
+            let mut details = channel::details(&client, &account, id.clone()).await?;
+            details.subscribed = recent.get(&id).or(details.subscribed);
+            Ok(details)
+        }))
+    }
+
+    fn channel_videos(&self, id: String, order: ChannelOrder) -> Option<BoxFuture<ChannelVideos>> {
+        let client = self.client.clone();
+        Some(Box::pin(async move { channel::videos(&client, id, order).await }))
+    }
+
+    fn channel_videos_more(&self, more: ChannelMore) -> Option<BoxFuture<ChannelVideos>> {
+        let client = self.client.clone();
+        Some(Box::pin(async move { channel::videos_more(&client, more).await }))
+    }
+
+    fn subscribe(&self, channel_id: String, subscribed: bool) -> Option<BoxFuture<()>> {
+        let account = self.account(Role::Recommendations);
+        account.method()?;
+        let recent = self.subscriptions.clone();
+        Some(Box::pin(async move {
+            channel::subscribe(&account, channel_id.clone(), subscribed).await?;
+            recent.set(channel_id, subscribed);
+            Ok(())
+        }))
+    }
+
     fn search(&self, query: String) -> Option<BoxFuture<SearchPage>> {
         let client = self.client.clone();
         Some(Box::pin(async move {
@@ -627,6 +695,7 @@ fn summary(item: VideoItem) -> VideoSummary {
     let channel_avatar_url = item.channel.as_ref().and_then(|channel| pick_thumbnail(&channel.avatar, 48));
     VideoSummary {
         thumbnail_url: pick_thumbnail(&item.thumbnail, 336),
+        channel_id: item.channel.as_ref().map(|channel| channel.id.clone()),
         channel: item.channel.map(|channel| channel.name),
         channel_avatar_url,
         duration: item.duration.map(|seconds| Duration::from_secs(seconds.into())),
@@ -798,6 +867,83 @@ mod tests {
                 assert!(!more.shelves.is_empty());
             }
         }
+    }
+
+    /// Network test: `cargo test -- --ignored --nocapture live_channel`
+    #[test]
+    #[ignore]
+    fn live_channel() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let youtube =
+            runtime.block_on(YouTube::new(reqwest::Client::new(), Resolver::default(), None)).expect("client");
+        let id = runtime.block_on(youtube.resolve_channel("@veritasium".into()).unwrap()).expect("resolve");
+        println!("== @veritasium is {id}");
+        let channel = runtime.block_on(youtube.channel(id.clone()).unwrap()).expect("channel");
+        println!(
+            "== {} {:?} subs {:?} videos {:?} verified {} subscribed {:?}",
+            channel.name,
+            channel.handle,
+            channel.subscribers,
+            channel.video_count,
+            channel.verified,
+            channel.subscribed
+        );
+        println!("   avatar {:?}\n   banner {:?}", channel.avatar_url, channel.banner_url);
+        println!("   {} videos, more: {}", channel.videos.videos.len(), channel.videos.more.is_some());
+        for video in channel.videos.videos.iter().take(3) {
+            println!("   {} | {:?} | {:?} | {:?}", video.title, video.channel, video.channel_id, video.views);
+        }
+        assert!(!channel.videos.videos.is_empty());
+        let more =
+            runtime.block_on(youtube.channel_videos_more(channel.videos.more.expect("more")).unwrap()).expect("more");
+        println!("== page 2: {} videos", more.videos.len());
+        assert!(!more.videos.is_empty());
+        let popular = runtime.block_on(youtube.channel_videos(id, ChannelOrder::Popular).unwrap()).expect("popular");
+        println!(
+            "== popular: {} videos, first {:?} {:?}",
+            popular.videos.len(),
+            popular.videos[0].title,
+            popular.videos[0].views
+        );
+        assert!(!popular.videos.is_empty());
+    }
+
+    /// Network test that subscribes the recommendation account to a channel and unsubscribes
+    /// it again: `cargo test -- --ignored --nocapture live_subscribe`
+    #[test]
+    #[ignore]
+    fn live_subscribe() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let youtube =
+            runtime.block_on(YouTube::new(reqwest::Client::new(), Resolver::default(), None)).expect("client");
+        let id = "UCHnyfMqiRRG1u-2MsSQLbXA".to_string();
+        let state =
+            |youtube: &YouTube| runtime.block_on(youtube.channel(id.clone()).unwrap()).expect("channel").subscribed;
+        let before = state(&youtube);
+        println!("before: {before:?}");
+        assert_eq!(before, Some(false), "expected a channel the account isn't subscribed to");
+        runtime.block_on(youtube.subscribe(id.clone(), true).unwrap()).expect("subscribe");
+        let mut during = state(&youtube);
+        for _ in 0..4 {
+            println!("after subscribing: {during:?}");
+            if during == Some(true) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            during = state(&youtube);
+        }
+        runtime.block_on(youtube.subscribe(id.clone(), false).unwrap()).expect("unsubscribe");
+        // The state a page reports lags a few seconds behind.
+        let mut after = state(&youtube);
+        for _ in 0..4 {
+            println!("after unsubscribing: {after:?}");
+            if after == Some(false) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            after = state(&youtube);
+        }
+        assert_eq!((during, after), (Some(true), Some(false)));
     }
 
     /// Network test: `cargo test -- --ignored --nocapture live_music`

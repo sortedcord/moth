@@ -23,7 +23,7 @@ use super::actions::{
 use super::images::ImageCache;
 use super::playback::{PlaybackSession, Status};
 use super::theme::{ACCENT, DEEP, PAD};
-use crate::backend::media::{VideoDetails, VideoRef};
+use crate::backend::media::{ChannelTarget, VideoDetails, VideoRef};
 use crate::desktop::Seek;
 use crate::settings::Settings;
 use menu::SettingsPopup;
@@ -41,6 +41,9 @@ pub enum Details {
 /// Emitted when the user picks another video on the page.
 pub struct OpenVideo(pub VideoRef);
 
+/// Emitted when the user picks a channel on the page.
+pub struct OpenChannel(pub ChannelTarget);
+
 pub struct WatchPage {
     video: VideoRef,
     session: Entity<PlaybackSession>,
@@ -57,6 +60,7 @@ pub struct WatchPage {
 }
 
 impl EventEmitter<OpenVideo> for WatchPage {}
+impl EventEmitter<OpenChannel> for WatchPage {}
 
 impl Focusable for WatchPage {
     fn focus_handle(&self, _: &gpui::App) -> FocusHandle {

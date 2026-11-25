@@ -126,6 +126,7 @@ impl Local {
             video: VideoRef { source: ID, id: name.to_string() },
             title: manifest.title.clone(),
             channel: Some(format!("{} (local)", manifest.channel.as_deref().unwrap_or("local file"))),
+            channel_id: None,
             channel_avatar_url: None,
             views: manifest.views,
             age: None,
@@ -193,6 +194,7 @@ impl Local {
         Ok(VideoDetails {
             title: manifest.title.clone(),
             channel: Channel {
+                id: None,
                 name: manifest.channel.clone().unwrap_or_else(|| "local file".into()),
                 avatar_url: None,
                 subscribers: None,

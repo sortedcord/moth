@@ -59,6 +59,7 @@ fn summary(id: &str, title: String) -> VideoSummary {
         video: VideoRef { source: super::ID, id: id.to_string() },
         title,
         channel: None,
+        channel_id: None,
         channel_avatar_url: None,
         views: None,
         age: None,
@@ -77,7 +78,10 @@ fn video_renderer(renderer: &Value) -> Option<VideoSummary> {
         .pointer("/thumbnail/thumbnails")
         .and_then(|thumbnails| serde_json::from_value(thumbnails.clone()).ok())
         .unwrap_or_default();
+    let bylines = ["shortBylineText", "longBylineText", "ownerText"];
+    let channel_id = bylines.iter().find_map(|name| renderer.get(name).and_then(find_channel_id));
     Some(VideoSummary {
+        channel_id,
         channel: field("shortBylineText").or_else(|| field("longBylineText")).or_else(|| field("ownerText")),
         views: field("viewCountText").and_then(|views| count(&views)),
         age: field("publishedTimeText"),
@@ -109,6 +113,7 @@ fn lockup(lockup: &Value) -> Option<VideoSummary> {
         .unwrap_or_default();
     let duration = find_text(lockup, "thumbnailBadgeViewModel").and_then(|badge| clock(&badge));
     Some(VideoSummary {
+        channel_id: find_channel_id(metadata),
         channel: parts.first().cloned(),
         views: parts.iter().find(|part| part.contains("view")).and_then(|views| count(views)),
         age: parts.iter().find(|part| part.ends_with("ago")).cloned(),
@@ -162,6 +167,7 @@ fn tile(tile: &Value) -> Option<VideoSummary> {
         .and_then(|thumbnails| serde_json::from_value(thumbnails.clone()).ok())
         .unwrap_or_default();
     Some(VideoSummary {
+        channel_id: find_channel_id(tile),
         channel: lines.first().and_then(|line| line.first()).cloned(),
         views: parts.iter().find(|part| part.contains("view")).and_then(|views| count(views)),
         age: parts.iter().find(|part| part.ends_with("ago")).map(|age| age.to_string()),
@@ -169,6 +175,21 @@ fn tile(tile: &Value) -> Option<VideoSummary> {
         thumbnail_url: pick_thumbnail(&thumbnails, 336),
         ..summary(id, title)
     })
+}
+
+/// The first channel id (`browseId` starting with `UC`) anywhere under `value`: the link on a
+/// channel's name, or the one the avatar or menu goes to.
+fn find_channel_id(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => map
+            .get("browseId")
+            .and_then(Value::as_str)
+            .filter(|id| id.starts_with("UC") && id.len() == 24)
+            .map(str::to_string)
+            .or_else(|| map.values().find_map(find_channel_id)),
+        Value::Array(items) => items.iter().find_map(find_channel_id),
+        _ => None,
+    }
 }
 
 /// The first text inside a `key` object anywhere under `value`.
@@ -208,7 +229,7 @@ pub fn pick_thumbnail(thumbnails: &[Thumbnail], min_width: u32) -> Option<String
 }
 
 /// "3,822,705 views" → 3822705; "1.2M views" → 1200000; "12K views" → 12000.
-fn count(text: &str) -> Option<u64> {
+pub fn count(text: &str) -> Option<u64> {
     let number: String =
         text.trim().chars().take_while(|c| c.is_ascii_digit() || matches!(c, ',' | '.' | 'K' | 'M' | 'B')).collect();
     let (digits, scale) = match number.chars().last()? {

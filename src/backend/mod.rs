@@ -22,8 +22,8 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use crate::dev::DevOptions;
 use accounts::{AccountInfo, DeviceCode, Role};
 use media::{
-    AlternateUrls, Link, SearchMore, SearchPage, Selection, StreamCatalog, VideoDetails, VideoRef, VideoSummary,
-    Watching,
+    AlternateUrls, ChannelDetails, ChannelMore, ChannelOrder, ChannelRef, ChannelVideos, Link, SearchMore, SearchPage,
+    Selection, StreamCatalog, VideoDetails, VideoRef, VideoSummary, Watching,
 };
 use music::{
     MusicSearchFilter, MusicSearchMore, MusicSearchPage, MusicSearchSuggestions, MusicShelf, PlayTarget, QueuePage,
@@ -211,6 +211,71 @@ impl Backend {
                 Some(future) => future.await,
                 None => Ok(Vec::new()),
             }
+        })
+    }
+
+    // ── Channels ─────────────────────────────────────────────────────────────
+
+    /// Whether `input` is a link to a channel (or a handle), not a video.
+    pub fn claims_channel(&self, input: &str) -> bool {
+        let input = input.trim();
+        self.sources.iter().any(|source| source.claims_channel(input))
+    }
+
+    /// The channel a link or handle points at.
+    pub fn resolve_channel(&self, input: String) -> impl Future<Output = Result<ChannelRef>> + use<> {
+        let input = input.trim().to_string();
+        let resolve = self
+            .sources
+            .iter()
+            .find(|source| source.claims_channel(&input))
+            .and_then(|source| Some((source.id(), source.resolve_channel(input.clone())?)));
+        self.run(async move {
+            let (source, resolve) = resolve.ok_or_else(|| anyhow!("Not a link to a channel"))?;
+            Ok(ChannelRef { source, id: resolve.await? })
+        })
+    }
+
+    /// Whether `source` has channel pages.
+    pub fn has_channels(&self, source: &str) -> bool {
+        self.source(source).is_ok_and(|source| source.has_channels())
+    }
+
+    /// The channel that posted `video`.
+    pub fn channel_of(&self, video: &VideoRef) -> impl Future<Output = Result<ChannelRef>> + use<> {
+        let source = video.source;
+        let future = self.source(source).ok().and_then(|source| source.channel_of(video.id.clone()));
+        self.run(async move {
+            let id = future.ok_or_else(|| anyhow!("that site has no channel pages"))?.await?;
+            Ok(ChannelRef { source, id })
+        })
+    }
+
+    pub fn channel(&self, channel: &ChannelRef) -> impl Future<Output = Result<ChannelDetails>> + use<> {
+        let future = self.source(channel.source).ok().and_then(|source| source.channel(channel.id.clone()));
+        self.run(async move { future.ok_or_else(|| anyhow!("that site has no channel pages"))?.await })
+    }
+
+    pub fn channel_videos(
+        &self,
+        channel: &ChannelRef,
+        order: ChannelOrder,
+    ) -> impl Future<Output = Result<ChannelVideos>> + use<> {
+        let future =
+            self.source(channel.source).ok().and_then(|source| source.channel_videos(channel.id.clone(), order));
+        self.run(async move { future.ok_or_else(|| anyhow!("that site has no channel pages"))?.await })
+    }
+
+    pub fn channel_videos_more(&self, more: ChannelMore) -> impl Future<Output = Result<ChannelVideos>> + use<> {
+        let future = self.source(more.source).ok().and_then(|source| source.channel_videos_more(more));
+        self.run(async move { future.ok_or_else(|| anyhow!("that site has no channel pages"))?.await })
+    }
+
+    pub fn subscribe(&self, channel: &ChannelRef, subscribed: bool) -> impl Future<Output = Result<()>> + use<> {
+        let future =
+            self.source(channel.source).ok().and_then(|source| source.subscribe(channel.id.clone(), subscribed));
+        self.run(async move {
+            future.ok_or_else(|| anyhow!("sign in a recommendation account to subscribe to channels"))?.await
         })
     }
 
