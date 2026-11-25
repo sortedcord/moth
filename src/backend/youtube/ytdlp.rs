@@ -130,7 +130,7 @@ pub fn resolve(video_id: &str, format: &str, cookies: Option<&Path>) -> Result<R
 /// URLs: Premium formats don't need SABR after all (#17).
 pub fn premium(video_id: &str, cookies: &Path) -> Result<Resolved> {
     let output = Command::new("nice")
-        .args(["-n", "10", "yt-dlp", "--no-warnings", "--no-playlist", "--ignore-no-formats-error", "-J", "--cookies"])
+        .args(["-n", "10", "yt-dlp", "--no-playlist", "--ignore-no-formats-error", "-J", "--cookies"])
         .arg(cookies)
         .args(["--", video_id])
         .output()
@@ -138,7 +138,23 @@ pub fn premium(video_id: &str, cookies: &Path) -> Result<Resolved> {
     if !output.status.success() {
         bail!("yt-dlp: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
-    parse_premium(&output.stdout)
+    let resolved = parse_premium(&output.stdout)?;
+    if resolved.catalog.video.is_empty() && resolved.catalog.audio.is_empty() {
+        // Without formats at all yt-dlp only warns, e.g. when it can't solve YouTube's
+        // n challenge (an outdated yt-dlp): say why there are none.
+        let warnings: Vec<_> = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter(|line| line.starts_with("WARNING") || line.starts_with("ERROR"))
+            .map(|line| line.chars().take(200).collect::<String>())
+            .collect();
+        if !warnings.is_empty() {
+            eprintln!(
+                "moth: yt-dlp warned while looking for Premium streams (is it up to date?):\n  {}",
+                warnings.join("\n  ")
+            );
+        }
+    }
+    Ok(resolved)
 }
 
 /// iTags of the 256 kbps audio (AAC and Opus), which are plain files like any other, only
