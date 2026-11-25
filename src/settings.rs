@@ -46,6 +46,9 @@ pub struct Settings {
     /// seeking far ahead works (YouTube, when it falls back to iOS-client URLs: web-client URLs via
     /// yt-dlp).
     pub seek_fallback: bool,
+    /// Download yt-dlp and Deno, and update them at most once a day, so YouTube's changes don't
+    /// break playback. Takes effect when moth starts.
+    pub keep_ytdlp_updated: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +78,7 @@ impl Default for Settings {
             player_stats: true,
             suspend_hidden_video: true,
             seek_fallback: true,
+            keep_ytdlp_updated: true,
         }
     }
 }

@@ -83,7 +83,9 @@ pub fn run(
         }
         text_input::bind_keys(cx);
         actions::bind(cx);
-        cx.set_global(Settings::load());
+        let settings = Settings::load();
+        backend.maintain_tools(settings.keep_ytdlp_updated);
+        cx.set_global(settings);
         cx.set_global(BackendHandle(backend));
         cx.set_global(dev);
 

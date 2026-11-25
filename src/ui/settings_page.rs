@@ -251,6 +251,11 @@ pub fn render(
             "Seekable stream URLs in the background",
             "Only when YouTube's visionOS client fails and moth falls back to the iOS client, whose stream URLs only serve a little ahead of playback: moth then asks yt-dlp for web URLs to the same files. Costs a few seconds of CPU per video; without it, seeking far ahead can fail.",
             switch("seek-fallback", settings.seek_fallback, |s| s.seek_fallback = !s.seek_fallback, cx),
+        ))
+        .child(row(
+            "Keep yt-dlp up to date",
+            "moth keeps its own yt-dlp and Deno in ~/.local/share/moth/bin and checks for new versions when it starts, at most once a day. YouTube changes often enough to break old versions (Premium streams and some videos then fail to play). Off: nothing is downloaded or updated; a copy moth already has is still used. Takes effect when moth restarts.",
+            switch("keep-ytdlp-updated", settings.keep_ytdlp_updated, |s| s.keep_ytdlp_updated = !s.keep_ytdlp_updated, cx),
         ));
 
     let interface = section("INTERFACE")

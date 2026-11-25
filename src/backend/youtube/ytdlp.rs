@@ -3,7 +3,6 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -11,6 +10,7 @@ use serde::Deserialize;
 
 use crate::backend::media::{AudioCodec, AudioStream, Location, StreamCatalog, StreamId, VideoCodec, VideoStream};
 use crate::backend::selection::StreamPreferences;
+use crate::backend::tools;
 
 /// Direct (non-HLS) streams only: the best video up to the preferred height in the preferred
 /// codec order, plus the best audio in the preferred codec.
@@ -109,8 +109,8 @@ impl Resolved {
 /// file) if given. Blocking; run it on a blocking thread.
 pub fn resolve(video_id: &str, format: &str, cookies: Option<&Path>) -> Result<Resolved> {
     // yt-dlp may run alongside playback (for alternate URLs), so keep it out of the way.
-    let mut command = Command::new("nice");
-    command.args(["-n", "10", "yt-dlp", "--no-warnings", "-f", format, "-j"]);
+    let mut command = tools::ytdlp_command();
+    command.args(["--no-warnings", "-f", format, "-j"]);
     if let Some(cookies) = cookies {
         command.arg("--cookies").arg(cookies);
     }
@@ -129,8 +129,8 @@ pub fn resolve(video_id: &str, format: &str, cookies: Option<&Path>) -> Result<R
 /// yt-dlp gets these from YouTube's TV client, signed in with the session, as plain HTTPS
 /// URLs: Premium formats don't need SABR after all (#17).
 pub fn premium(video_id: &str, cookies: &Path) -> Result<Resolved> {
-    let output = Command::new("nice")
-        .args(["-n", "10", "yt-dlp", "--no-playlist", "--ignore-no-formats-error", "-J", "--cookies"])
+    let output = tools::ytdlp_command()
+        .args(["--no-playlist", "--ignore-no-formats-error", "-J", "--cookies"])
         .arg(cookies)
         .args(["--", video_id])
         .output()

@@ -11,6 +11,7 @@ pub mod player;
 mod secrets;
 pub mod selection;
 pub mod source;
+mod tools;
 mod youtube;
 
 use std::future::Future;
@@ -80,6 +81,13 @@ impl Backend {
 
     pub fn http(&self) -> Http {
         Http { client: self.http.clone(), runtime: self.runtime.handle().clone() }
+    }
+
+    /// Install and update the programs moth runs for YouTube (see [`tools`]), if `enabled`.
+    pub fn maintain_tools(&self, enabled: bool) {
+        if enabled {
+            self.runtime.spawn(tools::maintain(self.http.clone()));
+        }
     }
 
     /// Run `future` on the tokio runtime; the returned future can be awaited from any executor.

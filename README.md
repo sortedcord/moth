@@ -52,7 +52,7 @@ moth isn't packaged yet; build it from source. On Arch Linux:
 
 ```sh
 sudo pacman -S rustup gst-plugins-good gst-plugins-bad gst-plugins-bad-libs gst-plugin-va \
-  pipewire-pulse gst-libav yt-dlp deno intel-media-driver vulkan-intel \
+  pipewire-pulse gst-libav intel-media-driver vulkan-intel \
   wayland libxkbcommon fontconfig freetype2 cmake clang
 rustup default stable
 git clone https://github.com/sortedcord/moth && cd moth
@@ -63,7 +63,14 @@ cargo build --release
 
 Requirements: a Wayland compositor, Vulkan, and PipeWire (with `pipewire-pulse`) or PulseAudio for audio. `intel-media-driver` and `vulkan-intel` are
 for Intel GPUs; use your GPU's VA-API driver and Vulkan driver instead (e.g. `libva-mesa-driver` and
-`vulkan-radeon` on AMD). yt-dlp (with deno for YouTube's JavaScript challenges) is used as a fallback resolver.
+`vulkan-radeon` on AMD).
+
+moth manages [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [Deno](https://deno.com) (which yt-dlp needs for
+YouTube's JavaScript challenges) itself: on the first start it downloads the official releases into
+`~/.local/share/moth/bin` (checked against the releases' SHA-256 sums) and looks for new versions at most once
+a day, because YouTube breaks old yt-dlp versions every few weeks. Turn that off with *Keep yt-dlp up to date*
+in Settings; moth then only uses a copy it already has. Without a copy of its own, moth runs the `yt-dlp` and
+`deno` on your `PATH`, which is also what happens on the very first start until the download finishes.
 
 ## Usage
 
@@ -214,8 +221,8 @@ moth is built on the work of many projects:
 - [gpui](https://gpui.rs) from [Zed](https://zed.dev) (Apache-2.0): the UI framework. `src/ui/text_input.rs` is
   adapted from gpui's text input example.
 - [RustyPipe](https://codeberg.org/ThetaDev/rustypipe) by ThetaDev (GPL-3.0): YouTube's internal API.
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) (Unlicense), with [Deno](https://deno.com) (MIT): fallback and
-  seek-ahead stream resolving.
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) (Unlicense), with [Deno](https://deno.com) (MIT): fallback,
+  seek-ahead and Premium stream resolving. Downloaded at runtime, not distributed with moth.
 - [GStreamer](https://gstreamer.freedesktop.org) (LGPL-2.1-or-later) and its
   [Rust bindings](https://gitlab.freedesktop.org/gstreamer/gstreamer-rs) (MIT/Apache-2.0): media playback.
 - [PipeWire](https://pipewire.org) (MIT): audio output.

@@ -46,6 +46,13 @@ directory up automatically (`MOTH_DEV_MEDIA=<dir>` points elsewhere, `MOTH_DEV_M
 codec menus, the status socket and MPRIS all behave as with a real site. Pass another video ID and name to the
 script to add more videos. Home cards other than local ones, and related videos, still come from YouTube.
 
+### yt-dlp and Deno
+
+moth downloads its own yt-dlp and Deno to `~/.local/share/moth/bin` and prefers them to the system ones
+(`backend/tools.rs`; the "Keep yt-dlp up to date" setting turns the downloading and updating off). To test
+against a particular yt-dlp, put it there, or delete the directory to go back to the one on your `PATH`.
+`XDG_DATA_HOME=<dir>` points moth at a throwaway one.
+
 ### Debug tools
 
 | | |

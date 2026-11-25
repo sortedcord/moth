@@ -12,6 +12,11 @@ pub fn cache_dir() -> PathBuf {
     base("XDG_CACHE_HOME", ".cache").join("moth")
 }
 
+/// `$XDG_DATA_HOME/moth` (default `~/.local/share/moth`).
+pub fn data_dir() -> PathBuf {
+    base("XDG_DATA_HOME", ".local/share").join("moth")
+}
+
 /// `$XDG_RUNTIME_DIR`, or the temp dir (per-user file names are then up to the caller).
 pub fn runtime_dir() -> Option<PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)
